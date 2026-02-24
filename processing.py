@@ -37,6 +37,18 @@ class RamPairSelection:
     mode: str  # available or used
 
 
+@dataclass(frozen=True)
+class CpuLoadPairSelection:
+    hostid: str
+    host: str
+    as_value: str
+    load_itemid: str
+    load_value_type: int
+    load_key: str
+    cpu_num_itemid: str
+    cpu_num_value_type: int
+
+
 def progress_bar(prefix: str, current: int, total: int) -> None:
     if total <= 0:
         return
@@ -186,6 +198,21 @@ def cpu_score(item: Dict) -> Tuple[int, str]:
     return score, transform
 
 
+def cpu_load_score(item: Dict) -> int:
+    key = item.get("key_", "")
+    if key == "system.cpu.load[all,avg5]":
+        return 220
+    if key == "system.cpu.load[all,avg1]":
+        return 210
+    if key == "system.cpu.load[all,avg15]":
+        return 200
+    if key.startswith("system.cpu.load[all,"):
+        return 160
+    if key.startswith("system.cpu.load"):
+        return 120
+    return -1
+
+
 def ram_direct_score(item: Dict) -> int:
     key = item.get("key_", "")
     name = item.get("name", "").lower()
@@ -262,9 +289,10 @@ def select_items(
     items_by_host: Dict[str, List[Dict]],
     host_meta: Dict[str, Dict[str, str]],
     disk_fs_preferences: Sequence[str],
-) -> Tuple[List[ItemSelection], List[RamPairSelection]]:
+) -> Tuple[List[ItemSelection], List[RamPairSelection], List[CpuLoadPairSelection]]:
     direct: List[ItemSelection] = []
     ram_pairs: List[RamPairSelection] = []
+    cpu_load_pairs: List[CpuLoadPairSelection] = []
 
     for hostid, host_items in items_by_host.items():
         host_info = host_meta.get(hostid)
@@ -293,6 +321,30 @@ def select_items(
                     as_value=as_value,
                 )
             )
+        else:
+            load_candidates: List[Tuple[int, Dict]] = []
+            cpu_num_item: Optional[Dict] = None
+            for item in host_items:
+                score = cpu_load_score(item)
+                if score >= 0:
+                    load_candidates.append((score, item))
+                if item.get("key_", "") == "system.cpu.num":
+                    cpu_num_item = item
+            if load_candidates and cpu_num_item is not None:
+                load_candidates.sort(key=lambda row: row[0], reverse=True)
+                load_item = load_candidates[0][1]
+                cpu_load_pairs.append(
+                    CpuLoadPairSelection(
+                        hostid=hostid,
+                        host=host_name,
+                        as_value=as_value,
+                        load_itemid=str(load_item["itemid"]),
+                        load_value_type=int(load_item.get("value_type", 0)),
+                        load_key=load_item.get("key_", ""),
+                        cpu_num_itemid=str(cpu_num_item["itemid"]),
+                        cpu_num_value_type=int(cpu_num_item.get("value_type", 3)),
+                    )
+                )
 
         ram_direct_candidates: List[Tuple[int, Dict]] = []
         for item in host_items:
@@ -375,7 +427,7 @@ def select_items(
                 )
             )
 
-    return direct, ram_pairs
+    return direct, ram_pairs, cpu_load_pairs
 
 
 def fetch_history_points(
@@ -803,6 +855,128 @@ def build_ram_pair_trend(
             }
         )
         rows.append(data)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "metric",
+                "clock",
+                "hostid",
+                "host",
+                "as_value",
+                "itemid",
+                "num",
+                "util_min",
+                "util_avg",
+                "util_max",
+            ]
+        )
+    return pd.concat(rows, ignore_index=True)
+
+
+def build_cpu_load_pair_history(
+    raw_history: pd.DataFrame, cpu_load_pairs: Sequence[CpuLoadPairSelection]
+) -> pd.DataFrame:
+    if raw_history.empty or not cpu_load_pairs:
+        return pd.DataFrame(
+            columns=["metric", "clock", "hostid", "host", "as_value", "itemid", "utilization_pct"]
+        )
+
+    rows: List[pd.DataFrame] = []
+    for pair in cpu_load_pairs:
+        load = raw_history[raw_history["itemid"] == pair.load_itemid][["clock", "value"]].copy()
+        cpu_num = raw_history[raw_history["itemid"] == pair.cpu_num_itemid][["value"]].copy()
+        if load.empty or cpu_num.empty:
+            continue
+        cpu_num_value = float(pd.to_numeric(cpu_num["value"], errors="coerce").dropna().iloc[-1])
+        if cpu_num_value <= 0:
+            continue
+        util = (pd.to_numeric(load["value"], errors="coerce") * 100.0) / cpu_num_value
+        data = pd.DataFrame(
+            {
+                "metric": "cpu",
+                "clock": load["clock"],
+                "hostid": pair.hostid,
+                "host": pair.host,
+                "as_value": pair.as_value,
+                "itemid": pair.load_itemid,
+                "utilization_pct": util.clip(lower=0.0, upper=100.0),
+            }
+        )
+        data = data.dropna(subset=["utilization_pct"])
+        if not data.empty:
+            rows.append(data)
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["metric", "clock", "hostid", "host", "as_value", "itemid", "utilization_pct"]
+        )
+    return pd.concat(rows, ignore_index=True)
+
+
+def build_cpu_load_pair_trend(
+    raw_trend: pd.DataFrame, cpu_load_pairs: Sequence[CpuLoadPairSelection]
+) -> pd.DataFrame:
+    if raw_trend.empty or not cpu_load_pairs:
+        return pd.DataFrame(
+            columns=[
+                "metric",
+                "clock",
+                "hostid",
+                "host",
+                "as_value",
+                "itemid",
+                "num",
+                "util_min",
+                "util_avg",
+                "util_max",
+            ]
+        )
+
+    rows: List[pd.DataFrame] = []
+    for pair in cpu_load_pairs:
+        load = raw_trend[raw_trend["itemid"] == pair.load_itemid][
+            ["clock", "num", "value_min", "value_avg", "value_max"]
+        ].copy()
+        cpu_num = raw_trend[raw_trend["itemid"] == pair.cpu_num_itemid][
+            ["clock", "value_avg", "value_max", "value_min"]
+        ].copy()
+        if load.empty or cpu_num.empty:
+            continue
+        cpu_num_series = pd.concat(
+            [
+                pd.to_numeric(cpu_num["value_avg"], errors="coerce"),
+                pd.to_numeric(cpu_num["value_max"], errors="coerce"),
+                pd.to_numeric(cpu_num["value_min"], errors="coerce"),
+            ],
+            ignore_index=True,
+        ).dropna()
+        if cpu_num_series.empty:
+            continue
+        cpu_num_value = float(cpu_num_series.iloc[-1])
+        if cpu_num_value <= 0:
+            continue
+        util_min = (pd.to_numeric(load["value_min"], errors="coerce") * 100.0) / cpu_num_value
+        util_avg = (pd.to_numeric(load["value_avg"], errors="coerce") * 100.0) / cpu_num_value
+        util_max = (pd.to_numeric(load["value_max"], errors="coerce") * 100.0) / cpu_num_value
+
+        data = pd.DataFrame(
+            {
+                "metric": "cpu",
+                "clock": load["clock"],
+                "hostid": pair.hostid,
+                "host": pair.host,
+                "as_value": pair.as_value,
+                "itemid": pair.load_itemid,
+                "num": load["num"],
+                "util_min": util_min.clip(lower=0.0, upper=100.0),
+                "util_avg": util_avg.clip(lower=0.0, upper=100.0),
+                "util_max": util_max.clip(lower=0.0, upper=100.0),
+            }
+        )
+        data = data.dropna(subset=["util_avg"])
+        if not data.empty:
+            rows.append(data)
 
     if not rows:
         return pd.DataFrame(

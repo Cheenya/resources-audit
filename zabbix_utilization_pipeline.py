@@ -15,6 +15,8 @@ from urllib3.exceptions import InsecureRequestWarning
 import config as cfg
 from plotting import plot_as_breakdown, plot_metric_dashboard
 from processing import (
+    build_cpu_load_pair_history,
+    build_cpu_load_pair_trend,
     build_direct_history,
     build_direct_trend,
     build_ram_pair_history,
@@ -60,6 +62,7 @@ def build_conclusion(
         {"section": "run", "key": "run_at_utc", "value": run_at.isoformat()},
         {"section": "run", "key": "matched_hosts", "value": str(matched_hosts)},
         {"section": "selection", "key": "cpu_items", "value": str(selected_counts.get("cpu_direct", 0))},
+        {"section": "selection", "key": "cpu_load_pair_items", "value": str(selected_counts.get("cpu_load_pair", 0))},
         {"section": "selection", "key": "ram_direct_items", "value": str(selected_counts.get("ram_direct", 0))},
         {"section": "selection", "key": "ram_pair_items", "value": str(selected_counts.get("ram_pair", 0))},
         {"section": "selection", "key": "disk_items", "value": str(selected_counts.get("disk_direct", 0))},
@@ -172,17 +175,19 @@ def main() -> int:
         log(f"Loaded items: {len(items)}")
 
         items_by_host = index_items_by_host(items)
-        direct_items, ram_pairs = select_items(items_by_host, host_meta, disk_fs_preferences)
+        direct_items, ram_pairs, cpu_load_pairs = select_items(items_by_host, host_meta, disk_fs_preferences)
 
-        cpu_count = len([item for item in direct_items if item.metric == "cpu"])
+        cpu_direct_count = len([item for item in direct_items if item.metric == "cpu"])
+        cpu_load_pair_count = len(cpu_load_pairs)
         ram_direct_count = len([item for item in direct_items if item.metric == "ram"])
         disk_count = len([item for item in direct_items if item.metric == "disk"])
         log(
             "Selected items: "
-            f"CPU={cpu_count}, RAM-direct={ram_direct_count}, RAM-pairs={len(ram_pairs)}, Disk={disk_count}"
+            f"CPU-direct={cpu_direct_count}, CPU-load-pairs={cpu_load_pair_count}, "
+            f"RAM-direct={ram_direct_count}, RAM-pairs={len(ram_pairs)}, Disk={disk_count}"
         )
 
-        if cpu_count == 0 or (ram_direct_count == 0 and len(ram_pairs) == 0) or disk_count == 0:
+        if (cpu_direct_count == 0 and cpu_load_pair_count == 0) or (ram_direct_count == 0 and len(ram_pairs) == 0) or disk_count == 0:
             log(
                 "Warning: some metrics are partially missing. "
                 "The script will continue with available metrics."
@@ -199,8 +204,19 @@ def main() -> int:
             ram_pair_itemid_to_type[pair.total_itemid] = pair.total_value_type
             ram_pair_itemid_to_type[pair.part_itemid] = pair.part_value_type
 
-        history_itemids = {**direct_itemid_to_type, **ram_pair_itemid_to_type}
-        trend_itemids = sorted(set(list(direct_itemid_to_type.keys()) + list(ram_pair_itemid_to_type.keys())))
+        cpu_load_pair_itemid_to_type: Dict[str, int] = {}
+        for pair in cpu_load_pairs:
+            cpu_load_pair_itemid_to_type[pair.load_itemid] = pair.load_value_type
+            cpu_load_pair_itemid_to_type[pair.cpu_num_itemid] = pair.cpu_num_value_type
+
+        history_itemids = {
+            **direct_itemid_to_type,
+            **ram_pair_itemid_to_type,
+            **cpu_load_pair_itemid_to_type,
+        }
+        trend_itemids = sorted(
+            set(list(direct_itemid_to_type.keys()) + list(ram_pair_itemid_to_type.keys()) + list(cpu_load_pair_itemid_to_type.keys()))
+        )
 
         log(f"Collecting {cfg.HISTORY_DAYS}-day exact history from history.get...")
         raw_history = fetch_history_points(
@@ -230,13 +246,15 @@ def main() -> int:
 
         history_direct = build_direct_history(raw_history, direct_items)
         history_ram_pairs = build_ram_pair_history(raw_history, ram_pairs)
-        history_util = pd.concat([history_direct, history_ram_pairs], ignore_index=True)
-        del raw_history, history_direct, history_ram_pairs
+        history_cpu_pairs = build_cpu_load_pair_history(raw_history, cpu_load_pairs)
+        history_util = pd.concat([history_direct, history_ram_pairs, history_cpu_pairs], ignore_index=True)
+        del raw_history, history_direct, history_ram_pairs, history_cpu_pairs
 
         trend_direct = build_direct_trend(raw_trend, direct_items)
         trend_ram_pairs = build_ram_pair_trend(raw_trend, ram_pairs)
-        trend_util = pd.concat([trend_direct, trend_ram_pairs], ignore_index=True)
-        del raw_trend, trend_direct, trend_ram_pairs
+        trend_cpu_pairs = build_cpu_load_pair_trend(raw_trend, cpu_load_pairs)
+        trend_util = pd.concat([trend_direct, trend_ram_pairs, trend_cpu_pairs], ignore_index=True)
+        del raw_trend, trend_direct, trend_ram_pairs, trend_cpu_pairs
 
         if history_util.empty and trend_util.empty:
             raise SystemExit("No utilization data extracted from selected items.")
@@ -284,6 +302,20 @@ def main() -> int:
                     "transform": pair.mode,
                 }
             )
+        for pair in cpu_load_pairs:
+            selection_rows.append(
+                {
+                    "hostid": pair.hostid,
+                    "host": pair.host,
+                    "as_value": pair.as_value,
+                    "metric": "cpu",
+                    "source": "pair",
+                    "itemid": pair.load_itemid,
+                    "key_": f"{pair.load_key}+system.cpu.num",
+                    "value_type": pair.load_value_type,
+                    "transform": "load_over_cpu_num",
+                }
+            )
         selection_report = pd.DataFrame(selection_rows)
 
         log("Saving CSV artifacts...")
@@ -294,7 +326,8 @@ def main() -> int:
         save_csv(trend_summary_as, output_dir / f"trend_summary_by_as_{cfg.TREND_DAYS}d.csv")
 
         selected_counts = {
-            "cpu_direct": cpu_count,
+            "cpu_direct": cpu_direct_count,
+            "cpu_load_pair": cpu_load_pair_count,
             "ram_direct": ram_direct_count,
             "ram_pair": len(ram_pairs),
             "disk_direct": disk_count,

@@ -103,7 +103,7 @@ python3 zabbix_utilization_pipeline.py
 
 Сценарий автоматически подбирает стандартные ключи:
 
-- CPU: `system.cpu.util*`
+- CPU: `system.cpu.util*`; если отсутствует, fallback на `system.cpu.load[all,avg*] / system.cpu.num`
 - RAM: `vm.memory.utilization*`, `vm.memory.size[pused]`, либо вычисление из пар `total + available/free/used`
 - Disk: `vfs.fs.size[<fs>,pused]`
 
