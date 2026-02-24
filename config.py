@@ -10,23 +10,9 @@ AS_TAG_KEY = "AS"
 AS_TAG_VALUES = "AS-01,AS-02"
 TAG_OPERATOR = "equals"  # equals | contains
 
-# Time windows and forecast
+# Time windows
 HISTORY_DAYS = 30
 TREND_DAYS = 365
-FORECAST_DAYS = 90
-
-# Forecast mode:
-# - "python": local regression forecast from trend summary
-# - "zabbix": read precomputed native forecast() values from Zabbix calculated items
-FORECAST_SOURCE = "python"  # python | zabbix
-
-# Native Zabbix forecast item keys (required only for FORECAST_SOURCE="zabbix")
-# Example: "custom.cpu.forecast.p90d"
-FORECAST_KEY_CPU = ""
-FORECAST_KEY_RAM = ""
-FORECAST_KEY_DISK = ""
-FORECAST_LOOKBACK_DAYS = 30
-CHECK_FORECAST_ONLY = False
 
 # Preferred filesystems for disk utilization item selection
 DISK_FS = "/,C:"

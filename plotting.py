@@ -16,12 +16,11 @@ def plot_metric_dashboard(
     history_raw: pd.DataFrame,
     history_summary: pd.DataFrame,
     trend_summary: pd.DataFrame,
-    forecast: pd.DataFrame,
     history_days: int,
     trend_days: int,
     output_file: Path,
 ) -> None:
-    fig, axes = plt.subplots(4, 1, figsize=(16, 20), constrained_layout=True)
+    fig, axes = plt.subplots(3, 1, figsize=(16, 16), constrained_layout=True)
 
     ax = axes[0]
     if not history_summary.empty:
@@ -94,39 +93,6 @@ def plot_metric_dashboard(
             ax.text(0.5, 0.5, "Not enough data for heatmap", ha="center", va="center", transform=ax.transAxes)
     else:
         ax.text(0.5, 0.5, "No exact data for heatmap", ha="center", va="center", transform=ax.transAxes)
-
-    ax = axes[3]
-    if not forecast.empty:
-        history_part = forecast[forecast["is_future"] == False].sort_values("timestamp")
-        future_part = forecast[forecast["is_future"] == True].sort_values("timestamp")
-
-        if not history_part.empty:
-            ax.plot(history_part["timestamp"], history_part["actual"], label="Historical daily mean", linewidth=1.2)
-            ax.plot(
-                history_part["timestamp"],
-                history_part["fitted"],
-                label="Model fit",
-                linestyle="--",
-                linewidth=1.1,
-                alpha=0.9,
-            )
-        if not future_part.empty:
-            ax.plot(future_part["timestamp"], future_part["predicted"], label="Forecast", linewidth=1.8)
-            ax.fill_between(
-                future_part["timestamp"],
-                future_part["lower"],
-                future_part["upper"],
-                alpha=0.2,
-                label="95% interval",
-            )
-        ax.axhline(80, color="orange", linewidth=1.0, linestyle=":")
-        ax.axhline(90, color="red", linewidth=1.0, linestyle=":")
-        ax.set_title(f"{metric.upper()} utilization forecast")
-        ax.set_ylabel("Utilization %")
-        ax.set_ylim(0, 100)
-        ax.legend(loc="upper left")
-    else:
-        ax.text(0.5, 0.5, "No forecast data", ha="center", va="center", transform=ax.transAxes)
 
     for axis in axes:
         axis.grid(alpha=0.25)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect CPU/RAM/Disk utilization from Zabbix API, summarize, forecast and plot."""
+"""Collect CPU/RAM/Disk utilization from Zabbix API, summarize and plot."""
 
 from __future__ import annotations
 
@@ -17,8 +17,6 @@ from plotting import plot_as_breakdown, plot_metric_dashboard
 from processing import (
     build_direct_history,
     build_direct_trend,
-    build_forecast,
-    build_native_forecast,
     build_ram_pair_history,
     build_ram_pair_trend,
     fetch_history_points,
@@ -26,10 +24,8 @@ from processing import (
     get_hosts_by_as,
     get_items_for_hosts,
     index_items_by_host,
-    inspect_native_forecast_items,
     parse_csv_values,
     pick_as_value,
-    select_native_forecast_items,
     select_items,
     summarize_history,
     summarize_trend,
@@ -49,25 +45,17 @@ def save_csv(frame: pd.DataFrame, path: Path) -> None:
 def main() -> int:
     if cfg.TAG_OPERATOR not in ("equals", "contains"):
         raise SystemExit("TAG_OPERATOR in config.py must be 'equals' or 'contains'.")
-    if cfg.HISTORY_DAYS <= 0 or cfg.TREND_DAYS <= 0 or cfg.FORECAST_DAYS < 0:
-        raise SystemExit("HISTORY_DAYS/TREND_DAYS must be > 0 and FORECAST_DAYS must be >= 0.")
+    if cfg.HISTORY_DAYS <= 0 or cfg.TREND_DAYS <= 0:
+        raise SystemExit("HISTORY_DAYS/TREND_DAYS must be > 0.")
     if cfg.CHUNK_SIZE <= 0 or cfg.REQUEST_TIMEOUT <= 0:
         raise SystemExit("CHUNK_SIZE and REQUEST_TIMEOUT in config.py must be > 0.")
     if not isinstance(cfg.VERIFY_SSL, bool):
         raise SystemExit("VERIFY_SSL in config.py must be boolean.")
-
-    forecast_source = str(getattr(cfg, "FORECAST_SOURCE", "python")).strip().lower()
-    if forecast_source not in ("python", "zabbix"):
-        raise SystemExit("FORECAST_SOURCE in config.py must be 'python' or 'zabbix'.")
-    forecast_lookback_days = int(getattr(cfg, "FORECAST_LOOKBACK_DAYS", cfg.HISTORY_DAYS))
-    if forecast_lookback_days <= 0:
-        raise SystemExit("FORECAST_LOOKBACK_DAYS in config.py must be > 0.")
     item_chunk_size = int(getattr(cfg, "ITEM_CHUNK_SIZE", cfg.CHUNK_SIZE))
     history_chunk_size = int(getattr(cfg, "HISTORY_CHUNK_SIZE", cfg.CHUNK_SIZE))
     trend_chunk_size = int(getattr(cfg, "TREND_CHUNK_SIZE", cfg.CHUNK_SIZE))
     if item_chunk_size <= 0 or history_chunk_size <= 0 or trend_chunk_size <= 0:
         raise SystemExit("ITEM_CHUNK_SIZE/HISTORY_CHUNK_SIZE/TREND_CHUNK_SIZE must be > 0.")
-    check_forecast_only = bool(getattr(cfg, "CHECK_FORECAST_ONLY", False))
 
     if cfg.VERIFY_SSL is False:
         log("Warning: TLS certificate verification is disabled (VERIFY_SSL=False).")
@@ -121,33 +109,6 @@ def main() -> int:
         log(f"Loaded items: {len(items)}")
 
         items_by_host = index_items_by_host(items)
-        native_forecast_keys = {
-            "cpu": str(getattr(cfg, "FORECAST_KEY_CPU", "")).strip(),
-            "ram": str(getattr(cfg, "FORECAST_KEY_RAM", "")).strip(),
-            "disk": str(getattr(cfg, "FORECAST_KEY_DISK", "")).strip(),
-        }
-        configured_forecast_metrics = [metric for metric, key_ in native_forecast_keys.items() if key_]
-        forecast_check = pd.DataFrame()
-        if configured_forecast_metrics:
-            forecast_check = inspect_native_forecast_items(
-                items_by_host=items_by_host,
-                host_meta=host_meta,
-                key_map=native_forecast_keys,
-            )
-            found = int(forecast_check["found"].sum()) if not forecast_check.empty else 0
-            has_expr = int(forecast_check["has_forecast_expr"].sum()) if not forecast_check.empty else 0
-            log(
-                "Forecast item check: "
-                f"configured={len(configured_forecast_metrics)}, found={found}, with forecast() expr={has_expr}"
-            )
-            save_csv(forecast_check, output_dir / "forecast_item_check.csv")
-            if check_forecast_only:
-                log("CHECK_FORECAST_ONLY=True: skipping history/trend collection.")
-                return 0
-        elif check_forecast_only:
-            log("CHECK_FORECAST_ONLY=True but forecast keys are empty; nothing to check.")
-            return 0
-
         direct_items, ram_pairs = select_items(items_by_host, host_meta, disk_fs_preferences)
 
         cpu_count = len([item for item in direct_items if item.metric == "cpu"])
@@ -187,6 +148,9 @@ def main() -> int:
             chunk_size=history_chunk_size,
         )
         log(f"Exact datapoints: {len(raw_history)}")
+        history_raw_path = output_dir / f"history_raw_api_{cfg.HISTORY_DAYS}d.csv"
+        save_csv(raw_history, history_raw_path)
+        log(f"Saved raw history API data: {history_raw_path.name}")
 
         log(f"Collecting {cfg.TREND_DAYS}-day trend data from trend.get...")
         raw_trend = fetch_trend_points(
@@ -197,69 +161,36 @@ def main() -> int:
             chunk_size=trend_chunk_size,
         )
         log(f"Trend datapoints: {len(raw_trend)}")
+        trend_raw_path = output_dir / f"trend_raw_api_{cfg.TREND_DAYS}d.csv"
+        save_csv(raw_trend, trend_raw_path)
+        log(f"Saved raw trend API data: {trend_raw_path.name}")
 
         history_direct = build_direct_history(raw_history, direct_items)
         history_ram_pairs = build_ram_pair_history(raw_history, ram_pairs)
         history_util = pd.concat([history_direct, history_ram_pairs], ignore_index=True)
+        del raw_history, history_direct, history_ram_pairs
 
         trend_direct = build_direct_trend(raw_trend, direct_items)
         trend_ram_pairs = build_ram_pair_trend(raw_trend, ram_pairs)
         trend_util = pd.concat([trend_direct, trend_ram_pairs], ignore_index=True)
+        del raw_trend, trend_direct, trend_ram_pairs
 
         if history_util.empty and trend_util.empty:
             raise SystemExit("No utilization data extracted from selected items.")
+
+        history_util_path = output_dir / f"history_exact_{cfg.HISTORY_DAYS}d.csv"
+        trend_util_path = output_dir / f"trend_{cfg.TREND_DAYS}d.csv"
+        save_csv(history_util, history_util_path)
+        save_csv(trend_util, trend_util_path)
+        log(
+            "Saved utilization checkpoints: "
+            f"{history_util_path.name}, {trend_util_path.name}"
+        )
 
         history_summary_all = summarize_history(history_util, by_as=False)
         history_summary_as = summarize_history(history_util, by_as=True)
         trend_summary_all = summarize_trend(trend_util, by_as=False)
         trend_summary_as = summarize_trend(trend_util, by_as=True)
-
-        native_forecast_items = []
-        forecast = pd.DataFrame(
-            columns=["metric", "timestamp", "is_future", "actual", "fitted", "predicted", "lower", "upper"]
-        )
-        if forecast_source == "zabbix":
-            native_forecast_items = select_native_forecast_items(
-                items_by_host=items_by_host,
-                host_meta=host_meta,
-                key_map=native_forecast_keys,
-            )
-            log(
-                "Native forecast mode: "
-                f"configured metrics={len(configured_forecast_metrics)}, selected items={len(native_forecast_items)}"
-            )
-            if native_forecast_items:
-                native_itemid_to_type = {item.itemid: item.value_type for item in native_forecast_items}
-                native_from = int((now - timedelta(days=forecast_lookback_days)).timestamp())
-                log(
-                    f"Collecting native forecast history from history.get "
-                    f"({forecast_lookback_days} days)..."
-                )
-                raw_native_forecast = fetch_history_points(
-                    api,
-                    itemid_to_value_type=native_itemid_to_type,
-                    time_from=native_from,
-                    time_till=time_till,
-                    chunk_size=history_chunk_size,
-                )
-                log(f"Native forecast datapoints: {len(raw_native_forecast)}")
-                forecast = build_native_forecast(
-                    raw_history=raw_native_forecast,
-                    selections=native_forecast_items,
-                    horizon_days=cfg.FORECAST_DAYS,
-                    now_ts=pd.Timestamp(now),
-                )
-                if forecast.empty:
-                    log("Warning: native forecast data is empty; fallback to python forecast model.")
-            else:
-                log("Warning: no native forecast items matched configured keys; fallback to python forecast model.")
-
-        if forecast.empty:
-            forecast = build_forecast(trend_summary_all, horizon_days=cfg.FORECAST_DAYS)
-            if forecast_source == "zabbix":
-                log("Forecast source used: python fallback.")
-        else:
-            log("Forecast source used: zabbix native.")
 
         selection_rows = []
         for item in direct_items:
@@ -290,31 +221,14 @@ def main() -> int:
                     "transform": pair.mode,
                 }
             )
-        for item in native_forecast_items:
-            selection_rows.append(
-                {
-                    "hostid": item.hostid,
-                    "host": item.host,
-                    "as_value": item.as_value,
-                    "metric": item.metric,
-                    "source": item.source,
-                    "itemid": item.itemid,
-                    "key_": item.key_,
-                    "value_type": item.value_type,
-                    "transform": item.transform,
-                }
-            )
         selection_report = pd.DataFrame(selection_rows)
 
         log("Saving CSV artifacts...")
         save_csv(selection_report, output_dir / "selected_items.csv")
-        save_csv(history_util, output_dir / f"history_exact_{cfg.HISTORY_DAYS}d.csv")
-        save_csv(trend_util, output_dir / f"trend_{cfg.TREND_DAYS}d.csv")
         save_csv(history_summary_all, output_dir / f"history_summary_all_{cfg.HISTORY_DAYS}d.csv")
         save_csv(history_summary_as, output_dir / f"history_summary_by_as_{cfg.HISTORY_DAYS}d.csv")
         save_csv(trend_summary_all, output_dir / f"trend_summary_all_{cfg.TREND_DAYS}d.csv")
         save_csv(trend_summary_as, output_dir / f"trend_summary_by_as_{cfg.TREND_DAYS}d.csv")
-        save_csv(forecast, output_dir / f"forecast_{cfg.FORECAST_DAYS}d.csv")
 
         context = {
             "run_at_utc": now.isoformat(),
@@ -324,17 +238,12 @@ def main() -> int:
             "as_tag_values": as_values,
             "history_days": cfg.HISTORY_DAYS,
             "trend_days": cfg.TREND_DAYS,
-            "forecast_days": cfg.FORECAST_DAYS,
-            "forecast_source": forecast_source,
-            "forecast_lookback_days": forecast_lookback_days,
-            "forecast_native_keys": native_forecast_keys,
             "host_count": len(hosts),
             "selected": {
                 "cpu_direct": cpu_count,
                 "ram_direct": ram_direct_count,
                 "ram_pair": len(ram_pairs),
                 "disk_direct": disk_count,
-                "native_forecast_items": len(native_forecast_items),
             },
             "verify_ssl": cfg.VERIFY_SSL,
             "chunk_size": cfg.CHUNK_SIZE,
@@ -343,7 +252,6 @@ def main() -> int:
             "trend_chunk_size": trend_chunk_size,
             "request_timeout": cfg.REQUEST_TIMEOUT,
             "plots_enabled": plots_enabled,
-            "check_forecast_only": check_forecast_only,
         }
         with (output_dir / "run_context.json").open("w", encoding="utf-8") as file:
             json.dump(context, file, indent=2, ensure_ascii=False)
@@ -352,21 +260,18 @@ def main() -> int:
             metrics = sorted(
                 set(history_util["metric"].unique())
                 .union(set(trend_util["metric"].unique()))
-                .union(set(forecast["metric"].unique()))
             )
             log("Building plots...")
             for metric in metrics:
                 metric_history_raw = history_util[history_util["metric"] == metric].copy()
                 metric_history_summary = history_summary_all[history_summary_all["metric"] == metric].copy()
                 metric_trend_summary = trend_summary_all[trend_summary_all["metric"] == metric].copy()
-                metric_forecast = forecast[forecast["metric"] == metric].copy()
 
                 plot_metric_dashboard(
                     metric=metric,
                     history_raw=metric_history_raw,
                     history_summary=metric_history_summary,
                     trend_summary=metric_trend_summary,
-                    forecast=metric_forecast,
                     history_days=cfg.HISTORY_DAYS,
                     trend_days=cfg.TREND_DAYS,
                     output_file=plots_dir / f"{metric}_dashboard.png",
