@@ -83,6 +83,13 @@ python3 zabbix_utilization_pipeline.py
 - `trend_summary_all_<TREND_DAYS>d.csv` - суммаризация трендов по всем хостам
 - `trend_summary_by_as_<TREND_DAYS>d.csv` - суммаризация трендов по AS
 - `run_context.json` - параметры и метаинформация запуска
+- `summary_report_<HISTORY_DAYS>d_<TREND_DAYS>d.xlsx` - единый отчет:
+  - `selected_items`
+  - `history_summary_all`
+  - `history_summary_by_as`
+  - `trend_summary_all`
+  - `trend_summary_by_as`
+  - `conclusion` (краткое заключение по статусам и трендам)
 
 В каталоге `<OUTPUT_DIR>/plots/`:
 

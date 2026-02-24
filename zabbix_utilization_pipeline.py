@@ -42,6 +42,69 @@ def save_csv(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index=False)
 
 
+def save_xlsx(path: Path, sheets: Dict[str, pd.DataFrame]) -> None:
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for sheet_name, frame in sheets.items():
+            safe_sheet_name = sheet_name[:31]
+            frame.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+
+
+def build_conclusion(
+    run_at: datetime,
+    matched_hosts: int,
+    selected_counts: Dict[str, int],
+    history_summary_all: pd.DataFrame,
+    trend_summary_all: pd.DataFrame,
+) -> pd.DataFrame:
+    rows = [
+        {"section": "run", "key": "run_at_utc", "value": run_at.isoformat()},
+        {"section": "run", "key": "matched_hosts", "value": str(matched_hosts)},
+        {"section": "selection", "key": "cpu_items", "value": str(selected_counts.get("cpu_direct", 0))},
+        {"section": "selection", "key": "ram_direct_items", "value": str(selected_counts.get("ram_direct", 0))},
+        {"section": "selection", "key": "ram_pair_items", "value": str(selected_counts.get("ram_pair", 0))},
+        {"section": "selection", "key": "disk_items", "value": str(selected_counts.get("disk_direct", 0))},
+    ]
+
+    metrics = sorted(
+        set(history_summary_all["metric"].unique()).union(set(trend_summary_all["metric"].unique()))
+    )
+    for metric in metrics:
+        metric_hist = history_summary_all[history_summary_all["metric"] == metric].sort_values("clock")
+        if not metric_hist.empty:
+            latest = metric_hist.iloc[-1]
+            mean_value = float(latest["util_mean"])
+            p90_value = float(latest["util_p90"])
+            if p90_value >= 90.0:
+                status = "critical"
+            elif mean_value >= 80.0:
+                status = "high"
+            else:
+                status = "normal"
+            rows.append({"section": metric, "key": "latest_history_mean_pct", "value": f"{mean_value:.2f}"})
+            rows.append({"section": metric, "key": "latest_history_p90_pct", "value": f"{p90_value:.2f}"})
+            rows.append({"section": metric, "key": "status", "value": status})
+
+        metric_trend = trend_summary_all[trend_summary_all["metric"] == metric].sort_values("clock")
+        if not metric_trend.empty:
+            daily = (
+                metric_trend.set_index("clock")["util_avg_mean"]
+                .resample("1D")
+                .mean()
+                .dropna()
+            )
+            if len(daily) >= 14:
+                recent_7d = float(daily.iloc[-7:].mean())
+                prev_7d = float(daily.iloc[-14:-7].mean())
+                delta = recent_7d - prev_7d
+                trend_state = "up" if delta > 1.0 else ("down" if delta < -1.0 else "flat")
+                rows.append({"section": metric, "key": "trend_recent_7d_mean_pct", "value": f"{recent_7d:.2f}"})
+                rows.append({"section": metric, "key": "trend_prev_7d_mean_pct", "value": f"{prev_7d:.2f}"})
+                rows.append({"section": metric, "key": "trend_delta_pp", "value": f"{delta:.2f}"})
+                rows.append({"section": metric, "key": "trend_state", "value": trend_state})
+
+    return pd.DataFrame(rows, columns=["section", "key", "value"])
+
+
 def main() -> int:
     if cfg.TAG_OPERATOR not in ("equals", "contains"):
         raise SystemExit("TAG_OPERATOR in config.py must be 'equals' or 'contains'.")
@@ -230,6 +293,34 @@ def main() -> int:
         save_csv(trend_summary_all, output_dir / f"trend_summary_all_{cfg.TREND_DAYS}d.csv")
         save_csv(trend_summary_as, output_dir / f"trend_summary_by_as_{cfg.TREND_DAYS}d.csv")
 
+        selected_counts = {
+            "cpu_direct": cpu_count,
+            "ram_direct": ram_direct_count,
+            "ram_pair": len(ram_pairs),
+            "disk_direct": disk_count,
+        }
+        conclusion = build_conclusion(
+            run_at=now,
+            matched_hosts=len(hosts),
+            selected_counts=selected_counts,
+            history_summary_all=history_summary_all,
+            trend_summary_all=trend_summary_all,
+        )
+
+        xlsx_path = output_dir / f"summary_report_{cfg.HISTORY_DAYS}d_{cfg.TREND_DAYS}d.xlsx"
+        save_xlsx(
+            xlsx_path,
+            {
+                "selected_items": selection_report,
+                "history_summary_all": history_summary_all,
+                "history_summary_by_as": history_summary_as,
+                "trend_summary_all": trend_summary_all,
+                "trend_summary_by_as": trend_summary_as,
+                "conclusion": conclusion,
+            },
+        )
+        log(f"Saved XLSX summary report: {xlsx_path.name}")
+
         context = {
             "run_at_utc": now.isoformat(),
             "api_url": api.url,
@@ -240,10 +331,7 @@ def main() -> int:
             "trend_days": cfg.TREND_DAYS,
             "host_count": len(hosts),
             "selected": {
-                "cpu_direct": cpu_count,
-                "ram_direct": ram_direct_count,
-                "ram_pair": len(ram_pairs),
-                "disk_direct": disk_count,
+                **selected_counts,
             },
             "verify_ssl": cfg.VERIFY_SSL,
             "chunk_size": cfg.CHUNK_SIZE,
