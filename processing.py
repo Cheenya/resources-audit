@@ -368,6 +368,40 @@ def select_items(
     return direct, ram_pairs
 
 
+def select_native_forecast_items(
+    items_by_host: Dict[str, List[Dict]],
+    host_meta: Dict[str, Dict[str, str]],
+    key_map: Dict[str, str],
+) -> List[ItemSelection]:
+    selections: List[ItemSelection] = []
+    for hostid, host_items in items_by_host.items():
+        host_info = host_meta.get(hostid)
+        if host_info is None:
+            continue
+        key_to_item = {item.get("key_", ""): item for item in host_items}
+        for metric, key_ in key_map.items():
+            key = key_.strip()
+            if not key:
+                continue
+            item = key_to_item.get(key)
+            if item is None:
+                continue
+            selections.append(
+                ItemSelection(
+                    hostid=hostid,
+                    host=host_info["host"],
+                    itemid=str(item["itemid"]),
+                    key_=key,
+                    value_type=int(item.get("value_type", 0)),
+                    metric=metric,
+                    transform="identity",
+                    as_value=host_info["as_value"],
+                    source="zabbix_native_forecast",
+                )
+            )
+    return selections
+
+
 def fetch_history_points(
     api: ZabbixAPI,
     itemid_to_value_type: Dict[str, int],
@@ -866,6 +900,62 @@ def summarize_trend(data: pd.DataFrame, by_as: bool) -> pd.DataFrame:
     summary = summary.join(grouped["util_avg"].quantile(0.10).rename("util_avg_p10"))
     summary = summary.join(grouped["util_avg"].quantile(0.90).rename("util_avg_p90"))
     return summary.reset_index()
+
+
+def build_native_forecast(
+    raw_history: pd.DataFrame,
+    selections: Sequence[ItemSelection],
+    horizon_days: int,
+    now_ts: pd.Timestamp,
+) -> pd.DataFrame:
+    if raw_history.empty or not selections:
+        return pd.DataFrame(
+            columns=["metric", "timestamp", "is_future", "actual", "fitted", "predicted", "lower", "upper"]
+        )
+
+    lookup = {selection.itemid: selection for selection in selections}
+    frame = raw_history[raw_history["itemid"].isin(lookup.keys())].copy()
+    if frame.empty:
+        return pd.DataFrame(
+            columns=["metric", "timestamp", "is_future", "actual", "fitted", "predicted", "lower", "upper"]
+        )
+
+    frame["metric"] = frame["itemid"].map(lambda itemid: lookup[itemid].metric)
+    frame["timestamp"] = (
+        frame["clock"] + pd.to_timedelta(max(0, int(horizon_days)), unit="D")
+    ).dt.floor("D")
+    frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
+    frame = frame.dropna(subset=["value"])
+    if frame.empty:
+        return pd.DataFrame(
+            columns=["metric", "timestamp", "is_future", "actual", "fitted", "predicted", "lower", "upper"]
+        )
+
+    grouped = frame.groupby(["metric", "timestamp"])["value"]
+    summary = grouped.agg(predicted="mean")
+    summary = summary.join(grouped.quantile(0.10).rename("lower"))
+    summary = summary.join(grouped.quantile(0.90).rename("upper"))
+    summary = summary.reset_index()
+
+    summary["predicted"] = summary["predicted"].clip(lower=0.0, upper=100.0)
+    summary["lower"] = summary["lower"].clip(lower=0.0, upper=100.0)
+    summary["upper"] = summary["upper"].clip(lower=0.0, upper=100.0)
+
+    now_utc = pd.Timestamp(now_ts)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.tz_localize("UTC")
+    else:
+        now_utc = now_utc.tz_convert("UTC")
+    now_day = now_utc.floor("D")
+
+    summary["is_future"] = summary["timestamp"] > now_day
+    summary["actual"] = np.where(summary["is_future"], np.nan, summary["predicted"])
+    summary["fitted"] = np.where(summary["is_future"], np.nan, summary["predicted"])
+    summary.loc[summary["is_future"] == False, ["lower", "upper"]] = np.nan
+
+    return summary[
+        ["metric", "timestamp", "is_future", "actual", "fitted", "predicted", "lower", "upper"]
+    ].sort_values(["metric", "timestamp"])
 
 
 def design_matrix(t: np.ndarray) -> np.ndarray:

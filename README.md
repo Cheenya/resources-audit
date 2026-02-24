@@ -25,12 +25,30 @@ pip install -r requirements.txt
 - `ZABBIX_PASSWORD`
 - `AS_TAG_KEY`, `AS_TAG_VALUES`, `TAG_OPERATOR`
 - `HISTORY_DAYS`, `TREND_DAYS`, `FORECAST_DAYS`
+- `FORECAST_SOURCE`, `FORECAST_LOOKBACK_DAYS`
+- `FORECAST_KEY_CPU`, `FORECAST_KEY_RAM`, `FORECAST_KEY_DISK`
 - `DISK_FS`
 - `CHUNK_SIZE`, `REQUEST_TIMEOUT`, `VERIFY_SSL`
 - `OUTPUT_DIR`
 - `PLOTS_ENABLED`
 
 Заполните `config.py` перед запуском.
+
+### Нативный forecast Zabbix
+
+По умолчанию используется локальная модель (`FORECAST_SOURCE = "python"`).
+
+Если хотите использовать нативный `forecast()` из Zabbix:
+
+- создайте в Zabbix рассчитанные item'ы (calculated items), где значение считается через `forecast(...)`;
+- в `config.py` включите `FORECAST_SOURCE = "zabbix"`;
+- задайте ключи рассчитанных item'ов:
+  - `FORECAST_KEY_CPU`
+  - `FORECAST_KEY_RAM`
+  - `FORECAST_KEY_DISK`
+- задайте `FORECAST_LOOKBACK_DAYS` (период истории этих forecast-item'ов для выгрузки).
+
+Если нативные forecast-item'ы не найдены или по ним нет данных, сценарий автоматически переключится на Python forecast.
 
 ## Структура кода (4 файла)
 

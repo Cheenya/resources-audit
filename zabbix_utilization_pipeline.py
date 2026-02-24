@@ -18,6 +18,7 @@ from processing import (
     build_direct_history,
     build_direct_trend,
     build_forecast,
+    build_native_forecast,
     build_ram_pair_history,
     build_ram_pair_trend,
     fetch_history_points,
@@ -27,6 +28,7 @@ from processing import (
     index_items_by_host,
     parse_csv_values,
     pick_as_value,
+    select_native_forecast_items,
     select_items,
     summarize_history,
     summarize_trend,
@@ -52,6 +54,14 @@ def main() -> int:
         raise SystemExit("CHUNK_SIZE and REQUEST_TIMEOUT in config.py must be > 0.")
     if not isinstance(cfg.VERIFY_SSL, bool):
         raise SystemExit("VERIFY_SSL in config.py must be boolean.")
+
+    forecast_source = str(getattr(cfg, "FORECAST_SOURCE", "python")).strip().lower()
+    if forecast_source not in ("python", "zabbix"):
+        raise SystemExit("FORECAST_SOURCE in config.py must be 'python' or 'zabbix'.")
+    forecast_lookback_days = int(getattr(cfg, "FORECAST_LOOKBACK_DAYS", cfg.HISTORY_DAYS))
+    if forecast_lookback_days <= 0:
+        raise SystemExit("FORECAST_LOOKBACK_DAYS in config.py must be > 0.")
+
     if cfg.VERIFY_SSL is False:
         log("Warning: TLS certificate verification is disabled (VERIFY_SSL=False).")
         urllib3.disable_warnings(InsecureRequestWarning)
@@ -169,7 +179,59 @@ def main() -> int:
         history_summary_as = summarize_history(history_util, by_as=True)
         trend_summary_all = summarize_trend(trend_util, by_as=False)
         trend_summary_as = summarize_trend(trend_util, by_as=True)
-        forecast = build_forecast(trend_summary_all, horizon_days=cfg.FORECAST_DAYS)
+
+        native_forecast_keys = {
+            "cpu": str(getattr(cfg, "FORECAST_KEY_CPU", "")).strip(),
+            "ram": str(getattr(cfg, "FORECAST_KEY_RAM", "")).strip(),
+            "disk": str(getattr(cfg, "FORECAST_KEY_DISK", "")).strip(),
+        }
+        native_forecast_items = []
+        forecast = pd.DataFrame(
+            columns=["metric", "timestamp", "is_future", "actual", "fitted", "predicted", "lower", "upper"]
+        )
+        if forecast_source == "zabbix":
+            native_forecast_items = select_native_forecast_items(
+                items_by_host=items_by_host,
+                host_meta=host_meta,
+                key_map=native_forecast_keys,
+            )
+            configured_metrics = [metric for metric, key_ in native_forecast_keys.items() if key_]
+            log(
+                "Native forecast mode: "
+                f"configured metrics={len(configured_metrics)}, selected items={len(native_forecast_items)}"
+            )
+            if native_forecast_items:
+                native_itemid_to_type = {item.itemid: item.value_type for item in native_forecast_items}
+                native_from = int((now - timedelta(days=forecast_lookback_days)).timestamp())
+                log(
+                    f"Collecting native forecast history from history.get "
+                    f"({forecast_lookback_days} days)..."
+                )
+                raw_native_forecast = fetch_history_points(
+                    api,
+                    itemid_to_value_type=native_itemid_to_type,
+                    time_from=native_from,
+                    time_till=time_till,
+                    chunk_size=cfg.CHUNK_SIZE,
+                )
+                log(f"Native forecast datapoints: {len(raw_native_forecast)}")
+                forecast = build_native_forecast(
+                    raw_history=raw_native_forecast,
+                    selections=native_forecast_items,
+                    horizon_days=cfg.FORECAST_DAYS,
+                    now_ts=pd.Timestamp(now),
+                )
+                if forecast.empty:
+                    log("Warning: native forecast data is empty; fallback to python forecast model.")
+            else:
+                log("Warning: no native forecast items matched configured keys; fallback to python forecast model.")
+
+        if forecast.empty:
+            forecast = build_forecast(trend_summary_all, horizon_days=cfg.FORECAST_DAYS)
+            if forecast_source == "zabbix":
+                log("Forecast source used: python fallback.")
+        else:
+            log("Forecast source used: zabbix native.")
 
         selection_rows = []
         for item in direct_items:
@@ -200,6 +262,20 @@ def main() -> int:
                     "transform": pair.mode,
                 }
             )
+        for item in native_forecast_items:
+            selection_rows.append(
+                {
+                    "hostid": item.hostid,
+                    "host": item.host,
+                    "as_value": item.as_value,
+                    "metric": item.metric,
+                    "source": item.source,
+                    "itemid": item.itemid,
+                    "key_": item.key_,
+                    "value_type": item.value_type,
+                    "transform": item.transform,
+                }
+            )
         selection_report = pd.DataFrame(selection_rows)
 
         log("Saving CSV artifacts...")
@@ -221,12 +297,16 @@ def main() -> int:
             "history_days": cfg.HISTORY_DAYS,
             "trend_days": cfg.TREND_DAYS,
             "forecast_days": cfg.FORECAST_DAYS,
+            "forecast_source": forecast_source,
+            "forecast_lookback_days": forecast_lookback_days,
+            "forecast_native_keys": native_forecast_keys,
             "host_count": len(hosts),
             "selected": {
                 "cpu_direct": cpu_count,
                 "ram_direct": ram_direct_count,
                 "ram_pair": len(ram_pairs),
                 "disk_direct": disk_count,
+                "native_forecast_items": len(native_forecast_items),
             },
             "verify_ssl": cfg.VERIFY_SSL,
             "chunk_size": cfg.CHUNK_SIZE,
@@ -237,7 +317,11 @@ def main() -> int:
             json.dump(context, file, indent=2, ensure_ascii=False)
 
         if plots_enabled and plots_dir is not None:
-            metrics = sorted(set(history_util["metric"].unique()).union(set(trend_util["metric"].unique())))
+            metrics = sorted(
+                set(history_util["metric"].unique())
+                .union(set(trend_util["metric"].unique()))
+                .union(set(forecast["metric"].unique()))
+            )
             log("Building plots...")
             for metric in metrics:
                 metric_history_raw = history_util[history_util["metric"] == metric].copy()
