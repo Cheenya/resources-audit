@@ -72,7 +72,13 @@ def save_xlsx(path: Path, sheets: Dict[str, pd.DataFrame]) -> None:
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         for sheet_name, frame in sheets.items():
             safe_sheet_name = sheet_name[:31]
-            frame.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+            frame_to_save = frame
+            tz_columns = frame.select_dtypes(include=["datetimetz"]).columns
+            if len(tz_columns) > 0:
+                frame_to_save = frame.copy()
+                for column in tz_columns:
+                    frame_to_save[column] = frame_to_save[column].dt.tz_convert("UTC").dt.tz_localize(None)
+            frame_to_save.to_excel(writer, sheet_name=safe_sheet_name, index=False)
 
 
 def build_conclusion(
