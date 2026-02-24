@@ -180,35 +180,36 @@ def cpu_score(item: Dict) -> Tuple[int, str]:
     key = item.get("key_", "")
     name = item.get("name", "").lower()
 
-    if key == "system.cpu.util[all,idle,avg5]":
-        score = 260
-        transform = "invert_100"
-    elif key == "system.cpu.util[all,idle,avg1]":
-        score = 250
-        transform = "invert_100"
-    elif key == "system.cpu.util[all,idle,avg15]":
-        score = 240
-        transform = "invert_100"
-    elif key.startswith("system.cpu.util[all,") and ",idle," in key:
-        score = 230
-        transform = "invert_100"
-    elif key.startswith("system.cpu.util[") and ",idle," in key:
-        score = 200
-        transform = "invert_100"
-    elif key == "system.cpu.util":
-        score = 170
-        transform = "identity"
-    elif key.startswith("system.cpu.util[all,"):
-        score = 140
-        transform = "identity"
-    elif key.startswith("system.cpu.util"):
-        score = 90
-        transform = "identity"
-    else:
-        score = -1
-        transform = "identity"
+    match = CPU_UTIL_RE.match(key)
+    if not match:
+        return -1, "identity"
 
-    if "cpu utilization" in name:
+    args_raw = match.group("args")
+    transform = "identity"
+    score = -1
+
+    if args_raw is None or args_raw.strip() == "":
+        # Bare system.cpu.util is accepted as fallback.
+        score = 170
+    else:
+        args = [part.strip().lower() for part in args_raw.split(",") if part.strip()]
+        if "idle" in args:
+            # Preferred source for total busy CPU: 100 - idle.
+            transform = "invert_100"
+            score = 220
+            if "all" in args:
+                score += 15
+            if "avg5" in args:
+                score += 15
+            elif "avg1" in args:
+                score += 10
+            elif "avg15" in args:
+                score += 5
+        else:
+            # user/system/iowait/steal variants are not used as total busy CPU signal.
+            score = -1
+
+    if score >= 0 and "cpu utilization" in name:
         score += 10
     return score, transform
 
@@ -245,6 +246,7 @@ def ram_direct_score(item: Dict) -> int:
 
 
 DISK_PUSED_RE = re.compile(r"^vfs\.fs\.size\[(?P<fs>[^,]+),pused\]$")
+CPU_UTIL_RE = re.compile(r"^system\.cpu\.util(?:\[(?P<args>[^\]]*)\])?$")
 TRANSIENT_API_ERROR_PATTERNS = (
     "gateway timeout",
     "gateway time-out",
