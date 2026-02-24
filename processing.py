@@ -180,14 +180,29 @@ def cpu_score(item: Dict) -> Tuple[int, str]:
     key = item.get("key_", "")
     name = item.get("name", "").lower()
 
-    if key == "system.cpu.util":
-        score = 200
-        transform = "identity"
-    elif key.startswith("system.cpu.util[") and "idle" in key:
-        score = 180
+    if key == "system.cpu.util[all,idle,avg5]":
+        score = 260
         transform = "invert_100"
+    elif key == "system.cpu.util[all,idle,avg1]":
+        score = 250
+        transform = "invert_100"
+    elif key == "system.cpu.util[all,idle,avg15]":
+        score = 240
+        transform = "invert_100"
+    elif key.startswith("system.cpu.util[all,") and ",idle," in key:
+        score = 230
+        transform = "invert_100"
+    elif key.startswith("system.cpu.util[") and ",idle," in key:
+        score = 200
+        transform = "invert_100"
+    elif key == "system.cpu.util":
+        score = 170
+        transform = "identity"
+    elif key.startswith("system.cpu.util[all,"):
+        score = 140
+        transform = "identity"
     elif key.startswith("system.cpu.util"):
-        score = 50
+        score = 90
         transform = "identity"
     else:
         score = -1
