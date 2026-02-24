@@ -111,17 +111,38 @@ def get_items_for_hosts(
 ) -> List[Dict]:
     fields = ["itemid", "hostid", "name", "key_", "value_type", "status", "units"]
     all_items: List[Dict] = []
-    host_chunks = list(chunked(list(hostids), chunk_size))
-    total_chunks = len(host_chunks)
-    for idx, host_chunk in enumerate(host_chunks, start=1):
+    queue = deque(chunked(list(hostids), chunk_size))
+    total_chunks = len(queue)
+    completed_chunks = 0
+    while queue:
+        host_chunk = queue.popleft()
         params = {
             "output": fields,
             "hostids": host_chunk,
             "filter": {"status": "0"},
         }
-        chunk_items = api.call("item.get", params)
+        try:
+            chunk_items = api.call("item.get", params)
+        except Exception as exc:
+            if len(host_chunk) > 1 and is_transient_api_error(exc):
+                midpoint = len(host_chunk) // 2
+                left_chunk = host_chunk[:midpoint]
+                right_chunk = host_chunk[midpoint:]
+                if left_chunk and right_chunk:
+                    print(
+                        f"\nitem.get: transient failure on chunk size {len(host_chunk)}, "
+                        f"splitting into {len(left_chunk)} + {len(right_chunk)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    queue.appendleft(right_chunk)
+                    queue.appendleft(left_chunk)
+                    total_chunks += 1
+                    continue
+            raise
         all_items.extend(chunk_items)
-        progress_bar("item.get", idx, total_chunks)
+        completed_chunks += 1
+        progress_bar("item.get", completed_chunks, total_chunks)
     return all_items
 
 
@@ -184,11 +205,29 @@ TRANSIENT_API_ERROR_PATTERNS = (
     "status 503",
     "status 504",
 )
+MIN_HISTORY_WINDOW_SECONDS = 15 * 60
+MIN_TREND_WINDOW_SECONDS = 6 * 60 * 60
 
 
 def is_transient_api_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return any(pattern in message for pattern in TRANSIENT_API_ERROR_PATTERNS)
+
+
+def split_time_window(
+    window_from: int, window_till: int, min_window_seconds: int
+) -> Optional[Tuple[Tuple[int, int], Tuple[int, int]]]:
+    span = int(window_till) - int(window_from)
+    if span <= max(1, int(min_window_seconds)):
+        return None
+    midpoint = int(window_from) + (span // 2)
+    if midpoint <= int(window_from) or midpoint >= int(window_till):
+        return None
+    left = (int(window_from), int(midpoint))
+    right = (int(midpoint) + 1, int(window_till))
+    if left[0] > left[1] or right[0] > right[1]:
+        return None
+    return left, right
 
 
 def disk_score(item: Dict, fs_preferences: Sequence[str]) -> Tuple[int, str]:
@@ -344,43 +383,70 @@ def fetch_history_points(
         by_type.setdefault(int(value_type), []).append(str(itemid))
 
     frames: List[pd.DataFrame] = []
-    request_plan: List[Tuple[int, List[str]]] = []
+    request_plan: List[Tuple[int, List[str], int, int]] = []
     for value_type, itemids in sorted(by_type.items()):
         for item_chunk in chunked(itemids, chunk_size):
-            request_plan.append((value_type, item_chunk))
+            request_plan.append((value_type, item_chunk, int(time_from), int(time_till)))
 
     queue = deque(request_plan)
     total_chunks = len(queue)
     completed_chunks = 0
     while queue:
-        value_type, item_chunk = queue.popleft()
+        value_type, item_chunk, window_from, window_till = queue.popleft()
         params = {
             "output": ["itemid", "clock", "ns", "value"],
             "history": value_type,
             "itemids": item_chunk,
-            "time_from": time_from,
-            "time_till": time_till,
+            "time_from": window_from,
+            "time_till": window_till,
             "sortfield": "clock",
             "sortorder": "ASC",
         }
         try:
             records = api.call("history.get", params)
         except Exception as exc:
-            if len(item_chunk) > 1 and is_transient_api_error(exc):
-                midpoint = len(item_chunk) // 2
-                left_chunk = item_chunk[:midpoint]
-                right_chunk = item_chunk[midpoint:]
-                if left_chunk and right_chunk:
+            if is_transient_api_error(exc):
+                if len(item_chunk) > 1:
+                    midpoint = len(item_chunk) // 2
+                    left_chunk = item_chunk[:midpoint]
+                    right_chunk = item_chunk[midpoint:]
+                    if left_chunk and right_chunk:
+                        print(
+                            f"\nhistory.get: transient failure on chunk size {len(item_chunk)}, "
+                            f"splitting into {len(left_chunk)} + {len(right_chunk)}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        queue.appendleft((value_type, right_chunk, window_from, window_till))
+                        queue.appendleft((value_type, left_chunk, window_from, window_till))
+                        total_chunks += 1
+                        continue
+                split = split_time_window(
+                    window_from,
+                    window_till,
+                    MIN_HISTORY_WINDOW_SECONDS,
+                )
+                if split is not None:
+                    (left_from, left_till), (right_from, right_till) = split
                     print(
-                        f"\nhistory.get: transient failure on chunk size {len(item_chunk)}, "
-                        f"splitting into {len(left_chunk)} + {len(right_chunk)}",
+                        f"\nhistory.get: transient failure on window {window_from}->{window_till}, "
+                        f"splitting into {left_from}->{left_till} and {right_from}->{right_till}",
                         file=sys.stderr,
                         flush=True,
                     )
-                    queue.appendleft((value_type, right_chunk))
-                    queue.appendleft((value_type, left_chunk))
+                    queue.appendleft((value_type, item_chunk, right_from, right_till))
+                    queue.appendleft((value_type, item_chunk, left_from, left_till))
                     total_chunks += 1
                     continue
+                print(
+                    f"\nhistory.get: skipped tiny failing window {window_from}->{window_till} "
+                    f"for itemids={len(item_chunk)} ({exc})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                completed_chunks += 1
+                progress_bar("history.get", completed_chunks, total_chunks)
+                continue
             raise
         if records:
             frame = pd.DataFrame.from_records(records)
@@ -413,37 +479,67 @@ def fetch_trend_points(
 
     frames: List[pd.DataFrame] = []
     unique_itemids = sorted(set(itemids))
-    queue = deque(chunked(unique_itemids, chunk_size))
+    queue = deque(
+        (item_chunk, int(time_from), int(time_till))
+        for item_chunk in chunked(unique_itemids, chunk_size)
+    )
     total_chunks = len(queue)
     completed_chunks = 0
     while queue:
-        item_chunk = queue.popleft()
+        item_chunk, window_from, window_till = queue.popleft()
         params = {
             "output": ["itemid", "clock", "num", "value_min", "value_avg", "value_max"],
             "itemids": item_chunk,
-            "time_from": time_from,
-            "time_till": time_till,
+            "time_from": window_from,
+            "time_till": window_till,
             "sortfield": "clock",
             "sortorder": "ASC",
         }
         try:
             records = api.call("trend.get", params)
         except Exception as exc:
-            if len(item_chunk) > 1 and is_transient_api_error(exc):
-                midpoint = len(item_chunk) // 2
-                left_chunk = item_chunk[:midpoint]
-                right_chunk = item_chunk[midpoint:]
-                if left_chunk and right_chunk:
+            if is_transient_api_error(exc):
+                if len(item_chunk) > 1:
+                    midpoint = len(item_chunk) // 2
+                    left_chunk = item_chunk[:midpoint]
+                    right_chunk = item_chunk[midpoint:]
+                    if left_chunk and right_chunk:
+                        print(
+                            f"\ntrend.get: transient failure on chunk size {len(item_chunk)}, "
+                            f"splitting into {len(left_chunk)} + {len(right_chunk)}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        queue.appendleft((right_chunk, window_from, window_till))
+                        queue.appendleft((left_chunk, window_from, window_till))
+                        total_chunks += 1
+                        continue
+                split = split_time_window(
+                    window_from,
+                    window_till,
+                    MIN_TREND_WINDOW_SECONDS,
+                )
+                if split is not None:
+                    (left_from, left_till), (right_from, right_till) = split
                     print(
-                        f"\ntrend.get: transient failure on chunk size {len(item_chunk)}, "
-                        f"splitting into {len(left_chunk)} + {len(right_chunk)}",
+                        f"\ntrend.get: transient failure on window {window_from}->{window_till}, "
+                        f"splitting into {left_from}->{left_till} and {right_from}->{right_till}",
                         file=sys.stderr,
                         flush=True,
                     )
-                    queue.appendleft(right_chunk)
-                    queue.appendleft(left_chunk)
+                    queue.appendleft((item_chunk, right_from, right_till))
+                    queue.appendleft((item_chunk, left_from, left_till))
                     total_chunks += 1
                     continue
+                print(
+                    f"\ntrend.get: skipped tiny failing window {window_from}->{window_till} "
+                    f"for itemids={len(item_chunk)} ({exc})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                completed_chunks += 1
+                progress_bar("trend.get", completed_chunks, total_chunks)
+                continue
             raise
         if records:
             frames.append(pd.DataFrame.from_records(records))
