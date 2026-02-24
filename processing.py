@@ -4,7 +4,7 @@ from collections import deque
 import re
 import sys
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -26,27 +26,17 @@ class ItemSelection:
 
 
 @dataclass(frozen=True)
-class RamPairSelection:
+class FeatureSelection:
     hostid: str
     host: str
     as_value: str
-    total_itemid: str
-    total_value_type: int
-    part_itemid: str
-    part_value_type: int
-    mode: str  # available or used
-
-
-@dataclass(frozen=True)
-class CpuLoadPairSelection:
-    hostid: str
-    host: str
-    as_value: str
-    load_itemid: str
-    load_value_type: int
-    load_key: str
-    cpu_num_itemid: str
-    cpu_num_value_type: int
+    metric: str
+    feature: str
+    itemid: str
+    key_: str
+    value_type: int
+    transform: str = "identity"
+    entity: str = ""
 
 
 def progress_bar(prefix: str, current: int, total: int) -> None:
@@ -189,7 +179,7 @@ def cpu_score(item: Dict) -> Tuple[int, str]:
     score = -1
 
     if args_raw is None or args_raw.strip() == "":
-        # Bare system.cpu.util is accepted as fallback.
+        # Bare system.cpu.util is accepted as secondary option.
         score = 170
     else:
         args = [part.strip().lower() for part in args_raw.split(",") if part.strip()]
@@ -214,38 +204,7 @@ def cpu_score(item: Dict) -> Tuple[int, str]:
     return score, transform
 
 
-def cpu_load_score(item: Dict) -> int:
-    key = item.get("key_", "")
-    if key == "system.cpu.load[all,avg5]":
-        return 220
-    if key == "system.cpu.load[all,avg1]":
-        return 210
-    if key == "system.cpu.load[all,avg15]":
-        return 200
-    if key.startswith("system.cpu.load[all,"):
-        return 160
-    if key.startswith("system.cpu.load"):
-        return 120
-    return -1
-
-
-def ram_direct_score(item: Dict) -> int:
-    key = item.get("key_", "")
-    name = item.get("name", "").lower()
-    if key.startswith("vm.memory.utilization"):
-        score = 200
-    elif key == "vm.memory.size[pused]":
-        score = 180
-    elif key.startswith("vm.memory.size[pused"):
-        score = 170
-    else:
-        score = -1
-    if "memory utilization" in name:
-        score += 10
-    return score
-
-
-DISK_PUSED_RE = re.compile(r"^vfs\.fs\.size\[(?P<fs>[^,]+),pused\]$")
+DISK_KEY_RE = re.compile(r"^vfs\.fs\.size\[(?P<fs>[^,]+),(?P<mode>pused|used|free|total)\]$")
 CPU_UTIL_RE = re.compile(r"^system\.cpu\.util(?:\[(?P<args>[^\]]*)\])?$")
 TRANSIENT_API_ERROR_PATTERNS = (
     "gateway timeout",
@@ -284,32 +243,47 @@ def split_time_window(
     return left, right
 
 
-def disk_score(item: Dict, fs_preferences: Sequence[str]) -> Tuple[int, str]:
-    key = item.get("key_", "")
-    match = DISK_PUSED_RE.match(key)
-    if not match:
-        return -1, ""
-
-    fs_name = match.group("fs")
-    fs_map = {fs: idx for idx, fs in enumerate(fs_preferences)}
-    score = 80
-    if fs_name in fs_map:
-        score = 200 - fs_map[fs_name]
-    elif fs_name == "/":
-        score = 170
-    elif fs_name.upper().startswith("C"):
-        score = 150
-    return score, fs_name
-
-
 def select_items(
     items_by_host: Dict[str, List[Dict]],
     host_meta: Dict[str, Dict[str, str]],
     disk_fs_preferences: Sequence[str],
-) -> Tuple[List[ItemSelection], List[RamPairSelection], List[CpuLoadPairSelection]]:
+) -> Tuple[List[ItemSelection], List[FeatureSelection]]:
     direct: List[ItemSelection] = []
-    ram_pairs: List[RamPairSelection] = []
-    cpu_load_pairs: List[CpuLoadPairSelection] = []
+    features: List[FeatureSelection] = []
+    fs_priority = {fs: idx for idx, fs in enumerate(disk_fs_preferences)}
+
+    def pick_best(candidates: List[Tuple[int, Dict]]) -> Optional[Dict]:
+        if not candidates:
+            return None
+        candidates.sort(key=lambda row: row[0], reverse=True)
+        return candidates[0][1]
+
+    def add_feature(
+        hostid: str,
+        host: str,
+        as_value: str,
+        metric: str,
+        feature: str,
+        item: Optional[Dict],
+        transform: str = "identity",
+        entity: str = "",
+    ) -> None:
+        if item is None:
+            return
+        features.append(
+            FeatureSelection(
+                hostid=hostid,
+                host=host,
+                as_value=as_value,
+                metric=metric,
+                feature=feature,
+                itemid=str(item["itemid"]),
+                key_=item.get("key_", ""),
+                value_type=int(item.get("value_type", 0)),
+                transform=transform,
+                entity=entity,
+            )
+        )
 
     for hostid, host_items in items_by_host.items():
         host_info = host_meta.get(hostid)
@@ -338,113 +312,138 @@ def select_items(
                     as_value=as_value,
                 )
             )
-        else:
-            load_candidates: List[Tuple[int, Dict]] = []
-            cpu_num_item: Optional[Dict] = None
-            for item in host_items:
-                score = cpu_load_score(item)
-                if score >= 0:
-                    load_candidates.append((score, item))
-                if item.get("key_", "") == "system.cpu.num":
-                    cpu_num_item = item
-            if load_candidates and cpu_num_item is not None:
-                load_candidates.sort(key=lambda row: row[0], reverse=True)
-                load_item = load_candidates[0][1]
-                cpu_load_pairs.append(
-                    CpuLoadPairSelection(
-                        hostid=hostid,
-                        host=host_name,
-                        as_value=as_value,
-                        load_itemid=str(load_item["itemid"]),
-                        load_value_type=int(load_item.get("value_type", 0)),
-                        load_key=load_item.get("key_", ""),
-                        cpu_num_itemid=str(cpu_num_item["itemid"]),
-                        cpu_num_value_type=int(cpu_num_item.get("value_type", 3)),
-                    )
-                )
 
-        ram_direct_candidates: List[Tuple[int, Dict]] = []
+        ram_pavailable_candidates: List[Tuple[int, Dict]] = []
+        ram_pused_candidates: List[Tuple[int, Dict]] = []
+        ram_available_candidates: List[Tuple[int, Dict]] = []
+        ram_used_candidates: List[Tuple[int, Dict]] = []
+        ram_total_candidates: List[Tuple[int, Dict]] = []
         for item in host_items:
-            score = ram_direct_score(item)
-            if score >= 0:
-                ram_direct_candidates.append((score, item))
-        if ram_direct_candidates:
-            ram_direct_candidates.sort(key=lambda row: row[0], reverse=True)
-            item = ram_direct_candidates[0][1]
+            key = item.get("key_", "")
+            if key == "vm.memory.size[total]":
+                ram_total_candidates.append((220, item))
+            elif key == "vm.memory.size[available]":
+                ram_available_candidates.append((220, item))
+            elif key == "vm.memory.size[free]":
+                ram_available_candidates.append((210, item))
+            elif key == "vm.memory.size[used]":
+                ram_used_candidates.append((220, item))
+            elif key == "vm.memory.size[pavailable]":
+                ram_pavailable_candidates.append((250, item))
+            elif key.startswith("vm.memory.size[pavailable"):
+                ram_pavailable_candidates.append((240, item))
+            elif key == "vm.memory.size[pused]":
+                ram_pused_candidates.append((180, item))
+            elif key.startswith("vm.memory.size[pused"):
+                ram_pused_candidates.append((170, item))
+
+        ram_pavailable_item = pick_best(ram_pavailable_candidates)
+        ram_pused_item = pick_best(ram_pused_candidates)
+        ram_available_item = pick_best(ram_available_candidates)
+        ram_used_item = pick_best(ram_used_candidates)
+        ram_total_item = pick_best(ram_total_candidates)
+
+        if ram_pavailable_item is not None:
             direct.append(
                 ItemSelection(
                     hostid=hostid,
                     host=host_name,
-                    itemid=str(item["itemid"]),
-                    key_=item.get("key_", ""),
-                    value_type=int(item.get("value_type", 0)),
+                    itemid=str(ram_pavailable_item["itemid"]),
+                    key_=ram_pavailable_item.get("key_", ""),
+                    value_type=int(ram_pavailable_item.get("value_type", 0)),
                     metric="ram",
-                    transform="identity",
+                    transform="invert_100",
                     as_value=as_value,
                 )
             )
-        else:
-            total_item: Optional[Dict] = None
-            available_item: Optional[Dict] = None
-            used_item: Optional[Dict] = None
-            for item in host_items:
-                key = item.get("key_", "")
-                if key == "vm.memory.size[total]":
-                    total_item = item
-                elif key in ("vm.memory.size[available]", "vm.memory.size[free]"):
-                    available_item = item
-                elif key == "vm.memory.size[used]":
-                    used_item = item
 
-            if total_item is not None and available_item is not None:
-                ram_pairs.append(
-                    RamPairSelection(
-                        hostid=hostid,
-                        host=host_name,
-                        as_value=as_value,
-                        total_itemid=str(total_item["itemid"]),
-                        total_value_type=int(total_item.get("value_type", 3)),
-                        part_itemid=str(available_item["itemid"]),
-                        part_value_type=int(available_item.get("value_type", 3)),
-                        mode="available",
-                    )
-                )
-            elif total_item is not None and used_item is not None:
-                ram_pairs.append(
-                    RamPairSelection(
-                        hostid=hostid,
-                        host=host_name,
-                        as_value=as_value,
-                        total_itemid=str(total_item["itemid"]),
-                        total_value_type=int(total_item.get("value_type", 3)),
-                        part_itemid=str(used_item["itemid"]),
-                        part_value_type=int(used_item.get("value_type", 3)),
-                        mode="used",
-                    )
-                )
+        add_feature(hostid, host_name, as_value, "ram", "pavailable_pct", ram_pavailable_item)
+        add_feature(hostid, host_name, as_value, "ram", "pused_pct", ram_pused_item)
+        add_feature(hostid, host_name, as_value, "ram", "available_bytes", ram_available_item)
+        add_feature(hostid, host_name, as_value, "ram", "used_bytes", ram_used_item)
+        add_feature(hostid, host_name, as_value, "ram", "total_bytes", ram_total_item)
 
-        disk_candidates: List[Tuple[int, str, Dict]] = []
+        disk_by_fs: Dict[str, Dict[str, Dict]] = {}
         for item in host_items:
-            score, fs_name = disk_score(item, disk_fs_preferences)
-            if score >= 0:
-                disk_candidates.append((score, fs_name, item))
+            key = item.get("key_", "")
+            match = DISK_KEY_RE.match(key)
+            if not match:
+                continue
+            fs_name = match.group("fs")
+            mode = match.group("mode")
+            disk_by_fs.setdefault(fs_name, {})[mode] = item
+
+        disk_candidates: List[Tuple[int, str, Dict[str, Dict]]] = []
+        for fs_name, fs_items in disk_by_fs.items():
+            if "pused" not in fs_items:
+                continue
+
+            if fs_name in fs_priority:
+                score = 1000 - fs_priority[fs_name]
+            elif fs_name == "/":
+                score = 700
+            elif fs_name.upper().startswith("C"):
+                score = 650
+            else:
+                score = 500
+
+            disk_candidates.append((score, fs_name, fs_items))
+
         if disk_candidates:
             disk_candidates.sort(key=lambda row: row[0], reverse=True)
-            _, _, item = disk_candidates[0]
-            direct.append(
-                ItemSelection(
-                    hostid=hostid,
-                    host=host_name,
-                    itemid=str(item["itemid"]),
-                    key_=item.get("key_", ""),
-                    value_type=int(item.get("value_type", 0)),
-                    metric="disk",
-                    transform="identity",
-                    as_value=as_value,
+            _, fs_name, fs_items = disk_candidates[0]
+            pused_item = fs_items.get("pused")
+            if pused_item is not None:
+                direct.append(
+                    ItemSelection(
+                        hostid=hostid,
+                        host=host_name,
+                        itemid=str(pused_item["itemid"]),
+                        key_=pused_item.get("key_", ""),
+                        value_type=int(pused_item.get("value_type", 0)),
+                        metric="disk",
+                        transform="identity",
+                        as_value=as_value,
+                    )
                 )
+                add_feature(
+                    hostid,
+                    host_name,
+                    as_value,
+                    "disk",
+                    "pused_pct",
+                    pused_item,
+                    entity=fs_name,
+                )
+            add_feature(
+                hostid,
+                host_name,
+                as_value,
+                "disk",
+                "used_bytes",
+                fs_items.get("used"),
+                entity=fs_name,
+            )
+            add_feature(
+                hostid,
+                host_name,
+                as_value,
+                "disk",
+                "free_bytes",
+                fs_items.get("free"),
+                entity=fs_name,
+            )
+            add_feature(
+                hostid,
+                host_name,
+                as_value,
+                "disk",
+                "total_bytes",
+                fs_items.get("total"),
+                entity=fs_name,
             )
 
-    return direct, ram_pairs, cpu_load_pairs
+    return direct, features
 
 
 def fetch_history_points(
@@ -453,6 +452,8 @@ def fetch_history_points(
     time_from: int,
     time_till: int,
     chunk_size: int,
+    on_chunk: Optional[Callable[[pd.DataFrame], None]] = None,
+    collect: bool = True,
 ) -> pd.DataFrame:
     if not itemid_to_value_type:
         return pd.DataFrame(columns=["itemid", "clock", "value", "ns"])
@@ -461,7 +462,7 @@ def fetch_history_points(
     for itemid, value_type in itemid_to_value_type.items():
         by_type.setdefault(int(value_type), []).append(str(itemid))
 
-    frames: List[pd.DataFrame] = []
+    frames: List[pd.DataFrame] = [] if collect else []
     request_plan: List[Tuple[int, List[str], int, int]] = []
     for value_type, itemids in sorted(by_type.items()):
         for item_chunk in chunked(itemids, chunk_size):
@@ -530,18 +531,25 @@ def fetch_history_points(
             raise
         if records:
             frame = pd.DataFrame.from_records(records)
-            frames.append(frame)
+            frame["itemid"] = frame["itemid"].astype(str)
+            frame["clock"] = pd.to_datetime(frame["clock"].astype("int64"), unit="s", utc=True)
+            frame["value"] = pd.to_numeric(frame["value"], errors="coerce")
+            if "ns" in frame.columns:
+                frame["ns"] = pd.to_numeric(frame["ns"], errors="coerce").fillna(0).astype("int64")
+            frame = frame.dropna(subset=["value"])
+            if not frame.empty:
+                frame["value"] = frame["value"].astype("float32")
+                if on_chunk is not None:
+                    on_chunk(frame)
+                if collect:
+                    frames.append(frame)
         completed_chunks += 1
         progress_bar("history.get", completed_chunks, total_chunks)
 
-    if not frames:
+    if not collect or not frames:
         return pd.DataFrame(columns=["itemid", "clock", "value", "ns"])
 
     raw = pd.concat(frames, ignore_index=True)
-    raw["itemid"] = raw["itemid"].astype(str)
-    raw["clock"] = pd.to_datetime(raw["clock"].astype("int64"), unit="s", utc=True)
-    raw["value"] = pd.to_numeric(raw["value"], errors="coerce")
-    raw = raw.dropna(subset=["value"])
     return raw
 
 
@@ -551,13 +559,15 @@ def fetch_trend_points(
     time_from: int,
     time_till: int,
     chunk_size: int,
+    on_chunk: Optional[Callable[[pd.DataFrame], None]] = None,
+    collect: bool = True,
 ) -> pd.DataFrame:
     if not itemids:
         return pd.DataFrame(
             columns=["itemid", "clock", "num", "value_min", "value_avg", "value_max"]
         )
 
-    frames: List[pd.DataFrame] = []
+    frames: List[pd.DataFrame] = [] if collect else []
     unique_itemids = sorted(set(itemids))
     queue = deque(
         (item_chunk, int(time_from), int(time_till))
@@ -623,21 +633,32 @@ def fetch_trend_points(
                 continue
             raise
         if records:
-            frames.append(pd.DataFrame.from_records(records))
+            frame = pd.DataFrame.from_records(records)
+            frame["itemid"] = frame["itemid"].astype(str)
+            frame["clock"] = pd.to_datetime(frame["clock"].astype("int64"), unit="s", utc=True)
+            frame["num"] = pd.to_numeric(frame["num"], errors="coerce")
+            frame["value_min"] = pd.to_numeric(frame["value_min"], errors="coerce")
+            frame["value_avg"] = pd.to_numeric(frame["value_avg"], errors="coerce")
+            frame["value_max"] = pd.to_numeric(frame["value_max"], errors="coerce")
+            frame = frame.dropna(subset=["value_avg"])
+            if not frame.empty:
+                frame["num"] = frame["num"].fillna(0).astype("int32")
+                frame["value_min"] = frame["value_min"].astype("float32")
+                frame["value_avg"] = frame["value_avg"].astype("float32")
+                frame["value_max"] = frame["value_max"].astype("float32")
+                if on_chunk is not None:
+                    on_chunk(frame)
+                if collect:
+                    frames.append(frame)
         completed_chunks += 1
         progress_bar("trend.get", completed_chunks, total_chunks)
 
-    if not frames:
+    if not collect or not frames:
         return pd.DataFrame(
             columns=["itemid", "clock", "num", "value_min", "value_avg", "value_max"]
         )
 
     raw = pd.concat(frames, ignore_index=True)
-    raw["itemid"] = raw["itemid"].astype(str)
-    raw["clock"] = pd.to_datetime(raw["clock"].astype("int64"), unit="s", utc=True)
-    for column in ("num", "value_min", "value_avg", "value_max"):
-        raw[column] = pd.to_numeric(raw[column], errors="coerce")
-    raw = raw.dropna(subset=["value_avg"])
     return raw
 
 
@@ -740,277 +761,140 @@ def build_direct_trend(
     ].copy()
 
 
-def build_ram_pair_history(
-    raw_history: pd.DataFrame, ram_pairs: Sequence[RamPairSelection]
+def build_feature_history(
+    raw_history: pd.DataFrame, selections: Sequence[FeatureSelection]
 ) -> pd.DataFrame:
-    if raw_history.empty or not ram_pairs:
-        return pd.DataFrame(
-            columns=["metric", "clock", "hostid", "host", "as_value", "itemid", "utilization_pct"]
-        )
-
-    rows: List[pd.DataFrame] = []
-    for pair in ram_pairs:
-        total = raw_history[raw_history["itemid"] == pair.total_itemid][["clock", "value"]].copy()
-        part = raw_history[raw_history["itemid"] == pair.part_itemid][["clock", "value"]].copy()
-        if total.empty or part.empty:
-            continue
-        total = total.sort_values("clock").rename(columns={"value": "total_value"})
-        part = part.sort_values("clock").rename(columns={"value": "part_value"})
-
-        merged = pd.merge_asof(
-            part,
-            total,
-            on="clock",
-            direction="nearest",
-            tolerance=pd.Timedelta(minutes=5),
-        )
-        merged = merged.dropna(subset=["part_value", "total_value"])
-        merged = merged[merged["total_value"] > 0]
-        if merged.empty:
-            continue
-
-        if pair.mode == "available":
-            util = (1.0 - merged["part_value"] / merged["total_value"]) * 100.0
-        else:
-            util = (merged["part_value"] / merged["total_value"]) * 100.0
-
-        data = pd.DataFrame(
-            {
-                "metric": "ram",
-                "clock": merged["clock"],
-                "hostid": pair.hostid,
-                "host": pair.host,
-                "as_value": pair.as_value,
-                "itemid": pair.part_itemid,
-                "utilization_pct": util.clip(lower=0.0, upper=100.0),
-            }
-        )
-        rows.append(data)
-
-    if not rows:
-        return pd.DataFrame(
-            columns=["metric", "clock", "hostid", "host", "as_value", "itemid", "utilization_pct"]
-        )
-
-    return pd.concat(rows, ignore_index=True)
-
-
-def build_ram_pair_trend(
-    raw_trend: pd.DataFrame, ram_pairs: Sequence[RamPairSelection]
-) -> pd.DataFrame:
-    if raw_trend.empty or not ram_pairs:
+    if raw_history.empty or not selections:
         return pd.DataFrame(
             columns=[
                 "metric",
+                "feature",
+                "entity",
+                "clock",
+                "hostid",
+                "host",
+                "as_value",
+                "itemid",
+                "value",
+            ]
+        )
+
+    lookup = {selection.itemid: selection for selection in selections}
+    frame = raw_history[raw_history["itemid"].isin(lookup.keys())].copy()
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "metric",
+                "feature",
+                "entity",
+                "clock",
+                "hostid",
+                "host",
+                "as_value",
+                "itemid",
+                "value",
+            ]
+        )
+
+    frame["transform"] = frame["itemid"].map(lambda itemid: lookup[itemid].transform)
+    frame["metric"] = frame["itemid"].map(lambda itemid: lookup[itemid].metric)
+    frame["feature"] = frame["itemid"].map(lambda itemid: lookup[itemid].feature)
+    frame["entity"] = frame["itemid"].map(lambda itemid: lookup[itemid].entity)
+    frame["hostid"] = frame["itemid"].map(lambda itemid: lookup[itemid].hostid)
+    frame["host"] = frame["itemid"].map(lambda itemid: lookup[itemid].host)
+    frame["as_value"] = frame["itemid"].map(lambda itemid: lookup[itemid].as_value)
+
+    frame["value"] = np.where(
+        frame["transform"] == "invert_100",
+        100.0 - frame["value"],
+        frame["value"],
+    )
+    pct_mask = frame["feature"].str.endswith("_pct", na=False)
+    frame.loc[pct_mask, "value"] = frame.loc[pct_mask, "value"].clip(lower=0.0, upper=100.0)
+
+    return frame[
+        ["metric", "feature", "entity", "clock", "hostid", "host", "as_value", "itemid", "value"]
+    ].copy()
+
+
+def build_feature_trend(
+    raw_trend: pd.DataFrame, selections: Sequence[FeatureSelection]
+) -> pd.DataFrame:
+    if raw_trend.empty or not selections:
+        return pd.DataFrame(
+            columns=[
+                "metric",
+                "feature",
+                "entity",
                 "clock",
                 "hostid",
                 "host",
                 "as_value",
                 "itemid",
                 "num",
-                "util_min",
-                "util_avg",
-                "util_max",
+                "value_min",
+                "value_avg",
+                "value_max",
             ]
         )
 
-    rows: List[pd.DataFrame] = []
-    for pair in ram_pairs:
-        total = raw_trend[raw_trend["itemid"] == pair.total_itemid][
-            ["clock", "num", "value_min", "value_avg", "value_max"]
-        ].copy()
-        part = raw_trend[raw_trend["itemid"] == pair.part_itemid][
-            ["clock", "num", "value_min", "value_avg", "value_max"]
-        ].copy()
-        if total.empty or part.empty:
-            continue
-
-        total = total.rename(
-            columns={
-                "num": "total_num",
-                "value_min": "total_min",
-                "value_avg": "total_avg",
-                "value_max": "total_max",
-            }
-        )
-        part = part.rename(
-            columns={
-                "num": "part_num",
-                "value_min": "part_min",
-                "value_avg": "part_avg",
-                "value_max": "part_max",
-            }
-        )
-        merged = pd.merge(part, total, on="clock", how="inner")
-        merged = merged[merged["total_avg"] > 0]
-        merged = merged[merged["total_min"] > 0]
-        merged = merged[merged["total_max"] > 0]
-        if merged.empty:
-            continue
-
-        if pair.mode == "available":
-            util_avg = (1.0 - merged["part_avg"] / merged["total_avg"]) * 100.0
-            util_min = (1.0 - merged["part_max"] / merged["total_min"]) * 100.0
-            util_max = (1.0 - merged["part_min"] / merged["total_max"]) * 100.0
-        else:
-            util_avg = (merged["part_avg"] / merged["total_avg"]) * 100.0
-            util_min = (merged["part_min"] / merged["total_max"]) * 100.0
-            util_max = (merged["part_max"] / merged["total_min"]) * 100.0
-
-        data = pd.DataFrame(
-            {
-                "metric": "ram",
-                "clock": merged["clock"],
-                "hostid": pair.hostid,
-                "host": pair.host,
-                "as_value": pair.as_value,
-                "itemid": pair.part_itemid,
-                "num": np.minimum(merged["part_num"], merged["total_num"]),
-                "util_min": util_min.clip(lower=0.0, upper=100.0),
-                "util_avg": util_avg.clip(lower=0.0, upper=100.0),
-                "util_max": util_max.clip(lower=0.0, upper=100.0),
-            }
-        )
-        rows.append(data)
-
-    if not rows:
+    lookup = {selection.itemid: selection for selection in selections}
+    frame = raw_trend[raw_trend["itemid"].isin(lookup.keys())].copy()
+    if frame.empty:
         return pd.DataFrame(
             columns=[
                 "metric",
+                "feature",
+                "entity",
                 "clock",
                 "hostid",
                 "host",
                 "as_value",
                 "itemid",
                 "num",
-                "util_min",
-                "util_avg",
-                "util_max",
-            ]
-        )
-    return pd.concat(rows, ignore_index=True)
-
-
-def build_cpu_load_pair_history(
-    raw_history: pd.DataFrame, cpu_load_pairs: Sequence[CpuLoadPairSelection]
-) -> pd.DataFrame:
-    if raw_history.empty or not cpu_load_pairs:
-        return pd.DataFrame(
-            columns=["metric", "clock", "hostid", "host", "as_value", "itemid", "utilization_pct"]
-        )
-
-    rows: List[pd.DataFrame] = []
-    for pair in cpu_load_pairs:
-        load = raw_history[raw_history["itemid"] == pair.load_itemid][["clock", "value"]].copy()
-        cpu_num = raw_history[raw_history["itemid"] == pair.cpu_num_itemid][["value"]].copy()
-        if load.empty or cpu_num.empty:
-            continue
-        cpu_num_value = float(pd.to_numeric(cpu_num["value"], errors="coerce").dropna().iloc[-1])
-        if cpu_num_value <= 0:
-            continue
-        util = (pd.to_numeric(load["value"], errors="coerce") * 100.0) / cpu_num_value
-        data = pd.DataFrame(
-            {
-                "metric": "cpu",
-                "clock": load["clock"],
-                "hostid": pair.hostid,
-                "host": pair.host,
-                "as_value": pair.as_value,
-                "itemid": pair.load_itemid,
-                "utilization_pct": util.clip(lower=0.0, upper=100.0),
-            }
-        )
-        data = data.dropna(subset=["utilization_pct"])
-        if not data.empty:
-            rows.append(data)
-
-    if not rows:
-        return pd.DataFrame(
-            columns=["metric", "clock", "hostid", "host", "as_value", "itemid", "utilization_pct"]
-        )
-    return pd.concat(rows, ignore_index=True)
-
-
-def build_cpu_load_pair_trend(
-    raw_trend: pd.DataFrame, cpu_load_pairs: Sequence[CpuLoadPairSelection]
-) -> pd.DataFrame:
-    if raw_trend.empty or not cpu_load_pairs:
-        return pd.DataFrame(
-            columns=[
-                "metric",
-                "clock",
-                "hostid",
-                "host",
-                "as_value",
-                "itemid",
-                "num",
-                "util_min",
-                "util_avg",
-                "util_max",
+                "value_min",
+                "value_avg",
+                "value_max",
             ]
         )
 
-    rows: List[pd.DataFrame] = []
-    for pair in cpu_load_pairs:
-        load = raw_trend[raw_trend["itemid"] == pair.load_itemid][
-            ["clock", "num", "value_min", "value_avg", "value_max"]
-        ].copy()
-        cpu_num = raw_trend[raw_trend["itemid"] == pair.cpu_num_itemid][
-            ["clock", "value_avg", "value_max", "value_min"]
-        ].copy()
-        if load.empty or cpu_num.empty:
-            continue
-        cpu_num_series = pd.concat(
-            [
-                pd.to_numeric(cpu_num["value_avg"], errors="coerce"),
-                pd.to_numeric(cpu_num["value_max"], errors="coerce"),
-                pd.to_numeric(cpu_num["value_min"], errors="coerce"),
-            ],
-            ignore_index=True,
-        ).dropna()
-        if cpu_num_series.empty:
-            continue
-        cpu_num_value = float(cpu_num_series.iloc[-1])
-        if cpu_num_value <= 0:
-            continue
-        util_min = (pd.to_numeric(load["value_min"], errors="coerce") * 100.0) / cpu_num_value
-        util_avg = (pd.to_numeric(load["value_avg"], errors="coerce") * 100.0) / cpu_num_value
-        util_max = (pd.to_numeric(load["value_max"], errors="coerce") * 100.0) / cpu_num_value
+    frame["transform"] = frame["itemid"].map(lambda itemid: lookup[itemid].transform)
+    frame["metric"] = frame["itemid"].map(lambda itemid: lookup[itemid].metric)
+    frame["feature"] = frame["itemid"].map(lambda itemid: lookup[itemid].feature)
+    frame["entity"] = frame["itemid"].map(lambda itemid: lookup[itemid].entity)
+    frame["hostid"] = frame["itemid"].map(lambda itemid: lookup[itemid].hostid)
+    frame["host"] = frame["itemid"].map(lambda itemid: lookup[itemid].host)
+    frame["as_value"] = frame["itemid"].map(lambda itemid: lookup[itemid].as_value)
 
-        data = pd.DataFrame(
-            {
-                "metric": "cpu",
-                "clock": load["clock"],
-                "hostid": pair.hostid,
-                "host": pair.host,
-                "as_value": pair.as_value,
-                "itemid": pair.load_itemid,
-                "num": load["num"],
-                "util_min": util_min.clip(lower=0.0, upper=100.0),
-                "util_avg": util_avg.clip(lower=0.0, upper=100.0),
-                "util_max": util_max.clip(lower=0.0, upper=100.0),
-            }
-        )
-        data = data.dropna(subset=["util_avg"])
-        if not data.empty:
-            rows.append(data)
+    inverted = frame["transform"] == "invert_100"
+    original_min = frame["value_min"].copy()
+    original_avg = frame["value_avg"].copy()
+    original_max = frame["value_max"].copy()
+    frame["value_avg"] = np.where(inverted, 100.0 - original_avg, original_avg)
+    frame["value_min"] = np.where(inverted, 100.0 - original_max, original_min)
+    frame["value_max"] = np.where(inverted, 100.0 - original_min, original_max)
 
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "metric",
-                "clock",
-                "hostid",
-                "host",
-                "as_value",
-                "itemid",
-                "num",
-                "util_min",
-                "util_avg",
-                "util_max",
-            ]
-        )
-    return pd.concat(rows, ignore_index=True)
+    pct_mask = frame["feature"].str.endswith("_pct", na=False)
+    frame.loc[pct_mask, "value_avg"] = frame.loc[pct_mask, "value_avg"].clip(lower=0.0, upper=100.0)
+    frame.loc[pct_mask, "value_min"] = frame.loc[pct_mask, "value_min"].clip(lower=0.0, upper=100.0)
+    frame.loc[pct_mask, "value_max"] = frame.loc[pct_mask, "value_max"].clip(lower=0.0, upper=100.0)
+
+    return frame[
+        [
+            "metric",
+            "feature",
+            "entity",
+            "clock",
+            "hostid",
+            "host",
+            "as_value",
+            "itemid",
+            "num",
+            "value_min",
+            "value_avg",
+            "value_max",
+        ]
+    ].copy()
 
 
 def summarize_history(data: pd.DataFrame, by_as: bool) -> pd.DataFrame:

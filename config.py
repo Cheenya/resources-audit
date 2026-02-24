@@ -11,7 +11,7 @@ AS_TAG_VALUES = "AS-01,AS-02"
 TAG_OPERATOR = "equals"  # equals | contains
 
 # Time windows
-HISTORY_DAYS = 30
+HISTORY_DAYS = 30  # set 0 to collect all available history
 TREND_DAYS = 365
 
 # Preferred filesystems for disk utilization item selection

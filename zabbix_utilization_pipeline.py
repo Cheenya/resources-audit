@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import pandas as pd
 import urllib3
@@ -15,12 +15,10 @@ from urllib3.exceptions import InsecureRequestWarning
 import config as cfg
 from plotting import plot_as_breakdown, plot_metric_dashboard
 from processing import (
-    build_cpu_load_pair_history,
-    build_cpu_load_pair_trend,
     build_direct_history,
     build_direct_trend,
-    build_ram_pair_history,
-    build_ram_pair_trend,
+    build_feature_history,
+    build_feature_trend,
     fetch_history_points,
     fetch_trend_points,
     get_hosts_by_as,
@@ -44,6 +42,33 @@ def save_csv(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index=False)
 
 
+def append_csv(frame: pd.DataFrame, path: Path) -> None:
+    if frame.empty:
+        return
+    has_existing_data = path.exists() and path.stat().st_size > 0
+    frame.to_csv(path, index=False, mode="a", header=not has_existing_data)
+
+
+def load_timeseries_csv(path: Path, columns: Sequence[str]) -> pd.DataFrame:
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=list(columns))
+    frame = pd.read_csv(path)
+    for column in ("itemid", "hostid", "host", "as_value", "metric", "feature", "entity"):
+        if column in frame.columns:
+            frame[column] = frame[column].astype("string")
+    for column in frame.columns:
+        if column in ("itemid", "hostid", "host", "as_value", "metric", "feature", "entity", "clock"):
+            continue
+        if pd.api.types.is_integer_dtype(frame[column]):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce", downcast="integer")
+        elif pd.api.types.is_float_dtype(frame[column]):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce", downcast="float")
+    if "clock" in frame.columns:
+        frame["clock"] = pd.to_datetime(frame["clock"], utc=True, errors="coerce")
+        frame = frame.dropna(subset=["clock"])
+    return frame
+
+
 def save_xlsx(path: Path, sheets: Dict[str, pd.DataFrame]) -> None:
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         for sheet_name, frame in sheets.items():
@@ -61,11 +86,12 @@ def build_conclusion(
     rows = [
         {"section": "run", "key": "run_at_utc", "value": run_at.isoformat()},
         {"section": "run", "key": "matched_hosts", "value": str(matched_hosts)},
-        {"section": "selection", "key": "cpu_items", "value": str(selected_counts.get("cpu_direct", 0))},
-        {"section": "selection", "key": "cpu_load_pair_items", "value": str(selected_counts.get("cpu_load_pair", 0))},
-        {"section": "selection", "key": "ram_direct_items", "value": str(selected_counts.get("ram_direct", 0))},
-        {"section": "selection", "key": "ram_pair_items", "value": str(selected_counts.get("ram_pair", 0))},
-        {"section": "selection", "key": "disk_items", "value": str(selected_counts.get("disk_direct", 0))},
+        {"section": "selection", "key": "cpu_target_items", "value": str(selected_counts.get("cpu_target", 0))},
+        {"section": "selection", "key": "ram_target_items", "value": str(selected_counts.get("ram_target", 0))},
+        {"section": "selection", "key": "disk_target_items", "value": str(selected_counts.get("disk_target", 0))},
+        {"section": "selection", "key": "ram_feature_items", "value": str(selected_counts.get("ram_features", 0))},
+        {"section": "selection", "key": "disk_feature_items", "value": str(selected_counts.get("disk_features", 0))},
+        {"section": "selection", "key": "feature_items_total", "value": str(selected_counts.get("feature_total", 0))},
     ]
 
     metrics = sorted(
@@ -111,8 +137,8 @@ def build_conclusion(
 def main() -> int:
     if cfg.TAG_OPERATOR not in ("equals", "contains"):
         raise SystemExit("TAG_OPERATOR in config.py must be 'equals' or 'contains'.")
-    if cfg.HISTORY_DAYS <= 0 or cfg.TREND_DAYS <= 0:
-        raise SystemExit("HISTORY_DAYS/TREND_DAYS must be > 0.")
+    if cfg.HISTORY_DAYS < 0 or cfg.TREND_DAYS <= 0:
+        raise SystemExit("HISTORY_DAYS must be >= 0 and TREND_DAYS must be > 0.")
     if cfg.CHUNK_SIZE <= 0 or cfg.REQUEST_TIMEOUT <= 0:
         raise SystemExit("CHUNK_SIZE and REQUEST_TIMEOUT in config.py must be > 0.")
     if not isinstance(cfg.VERIFY_SSL, bool):
@@ -175,97 +201,169 @@ def main() -> int:
         log(f"Loaded items: {len(items)}")
 
         items_by_host = index_items_by_host(items)
-        direct_items, ram_pairs, cpu_load_pairs = select_items(items_by_host, host_meta, disk_fs_preferences)
+        direct_items, feature_items = select_items(items_by_host, host_meta, disk_fs_preferences)
 
-        cpu_direct_count = len([item for item in direct_items if item.metric == "cpu"])
-        cpu_load_pair_count = len(cpu_load_pairs)
-        ram_direct_count = len([item for item in direct_items if item.metric == "ram"])
-        disk_count = len([item for item in direct_items if item.metric == "disk"])
+        cpu_target_count = len([item for item in direct_items if item.metric == "cpu"])
+        ram_target_count = len([item for item in direct_items if item.metric == "ram"])
+        disk_target_count = len([item for item in direct_items if item.metric == "disk"])
+        ram_feature_count = len([item for item in feature_items if item.metric == "ram"])
+        disk_feature_count = len([item for item in feature_items if item.metric == "disk"])
+        feature_total_count = len(feature_items)
         log(
             "Selected items: "
-            f"CPU-direct={cpu_direct_count}, CPU-load-pairs={cpu_load_pair_count}, "
-            f"RAM-direct={ram_direct_count}, RAM-pairs={len(ram_pairs)}, Disk={disk_count}"
+            f"CPU-target={cpu_target_count}, RAM-target={ram_target_count}, "
+            f"Disk-target={disk_target_count}, RAM-features={ram_feature_count}, "
+            f"Disk-features={disk_feature_count}"
         )
 
-        if (cpu_direct_count == 0 and cpu_load_pair_count == 0) or (ram_direct_count == 0 and len(ram_pairs) == 0) or disk_count == 0:
+        if cpu_target_count == 0 or ram_target_count == 0 or disk_target_count == 0:
             log(
                 "Warning: some metrics are partially missing. "
                 "The script will continue with available metrics."
             )
 
         now = datetime.now(timezone.utc)
-        history_from = int((now - timedelta(days=cfg.HISTORY_DAYS)).timestamp())
+        history_all_available = int(cfg.HISTORY_DAYS) == 0
+        history_from = 1 if history_all_available else int((now - timedelta(days=cfg.HISTORY_DAYS)).timestamp())
         trend_from = int((now - timedelta(days=cfg.TREND_DAYS)).timestamp())
         time_till = int(now.timestamp())
+        history_window_label = "all" if history_all_available else f"{cfg.HISTORY_DAYS}d"
+        trend_window_label = f"{cfg.TREND_DAYS}d"
 
         direct_itemid_to_type = {item.itemid: item.value_type for item in direct_items}
-        ram_pair_itemid_to_type: Dict[str, int] = {}
-        for pair in ram_pairs:
-            ram_pair_itemid_to_type[pair.total_itemid] = pair.total_value_type
-            ram_pair_itemid_to_type[pair.part_itemid] = pair.part_value_type
-
-        cpu_load_pair_itemid_to_type: Dict[str, int] = {}
-        for pair in cpu_load_pairs:
-            cpu_load_pair_itemid_to_type[pair.load_itemid] = pair.load_value_type
-            cpu_load_pair_itemid_to_type[pair.cpu_num_itemid] = pair.cpu_num_value_type
+        feature_itemid_to_type = {item.itemid: item.value_type for item in feature_items}
 
         history_itemids = {
             **direct_itemid_to_type,
-            **ram_pair_itemid_to_type,
-            **cpu_load_pair_itemid_to_type,
+            **feature_itemid_to_type,
         }
         trend_itemids = sorted(
-            set(list(direct_itemid_to_type.keys()) + list(ram_pair_itemid_to_type.keys()) + list(cpu_load_pair_itemid_to_type.keys()))
+            set(
+                list(direct_itemid_to_type.keys())
+                + list(feature_itemid_to_type.keys())
+            )
         )
 
-        log(f"Collecting {cfg.HISTORY_DAYS}-day exact history from history.get...")
-        raw_history = fetch_history_points(
+        history_raw_path = output_dir / f"history_raw_api_{history_window_label}.csv"
+        trend_raw_path = output_dir / f"trend_raw_api_{trend_window_label}.csv"
+        history_util_path = output_dir / f"history_exact_{history_window_label}.csv"
+        trend_util_path = output_dir / f"trend_{trend_window_label}.csv"
+        history_features_path = output_dir / f"history_features_{history_window_label}.csv"
+        trend_features_path = output_dir / f"trend_features_{trend_window_label}.csv"
+        for path in (
+            history_raw_path,
+            trend_raw_path,
+            history_util_path,
+            trend_util_path,
+            history_features_path,
+            trend_features_path,
+        ):
+            if path.exists():
+                path.unlink()
+
+        history_raw_count = 0
+        history_util_count = 0
+        history_feature_count = 0
+
+        def on_history_chunk(chunk: pd.DataFrame) -> None:
+            nonlocal history_raw_count, history_util_count, history_feature_count
+            history_raw_count += len(chunk)
+            append_csv(chunk, history_raw_path)
+
+            util_chunk = build_direct_history(chunk, direct_items)
+            history_util_count += len(util_chunk)
+            append_csv(util_chunk, history_util_path)
+
+            feature_chunk = build_feature_history(chunk, feature_items)
+            history_feature_count += len(feature_chunk)
+            append_csv(feature_chunk, history_features_path)
+
+        if history_all_available:
+            log("Collecting all available exact history from history.get...")
+        else:
+            log(f"Collecting {cfg.HISTORY_DAYS}-day exact history from history.get...")
+        fetch_history_points(
             api,
             itemid_to_value_type=history_itemids,
             time_from=history_from,
             time_till=time_till,
             chunk_size=history_chunk_size,
+            on_chunk=on_history_chunk,
+            collect=False,
         )
-        log(f"Exact datapoints: {len(raw_history)}")
-        history_raw_path = output_dir / f"history_raw_api_{cfg.HISTORY_DAYS}d.csv"
-        save_csv(raw_history, history_raw_path)
+        log(
+            f"Exact datapoints: raw={history_raw_count}, "
+            f"target={history_util_count}, features={history_feature_count}"
+        )
         log(f"Saved raw history API data: {history_raw_path.name}")
 
+        trend_raw_count = 0
+        trend_util_count = 0
+        trend_feature_count = 0
+
+        def on_trend_chunk(chunk: pd.DataFrame) -> None:
+            nonlocal trend_raw_count, trend_util_count, trend_feature_count
+            trend_raw_count += len(chunk)
+            append_csv(chunk, trend_raw_path)
+
+            util_chunk = build_direct_trend(chunk, direct_items)
+            trend_util_count += len(util_chunk)
+            append_csv(util_chunk, trend_util_path)
+
+            feature_chunk = build_feature_trend(chunk, feature_items)
+            trend_feature_count += len(feature_chunk)
+            append_csv(feature_chunk, trend_features_path)
+
         log(f"Collecting {cfg.TREND_DAYS}-day trend data from trend.get...")
-        raw_trend = fetch_trend_points(
+        fetch_trend_points(
             api,
             itemids=trend_itemids,
             time_from=trend_from,
             time_till=time_till,
             chunk_size=trend_chunk_size,
+            on_chunk=on_trend_chunk,
+            collect=False,
         )
-        log(f"Trend datapoints: {len(raw_trend)}")
-        trend_raw_path = output_dir / f"trend_raw_api_{cfg.TREND_DAYS}d.csv"
-        save_csv(raw_trend, trend_raw_path)
+        log(
+            f"Trend datapoints: raw={trend_raw_count}, "
+            f"target={trend_util_count}, features={trend_feature_count}"
+        )
         log(f"Saved raw trend API data: {trend_raw_path.name}")
 
-        history_direct = build_direct_history(raw_history, direct_items)
-        history_ram_pairs = build_ram_pair_history(raw_history, ram_pairs)
-        history_cpu_pairs = build_cpu_load_pair_history(raw_history, cpu_load_pairs)
-        history_util = pd.concat([history_direct, history_ram_pairs, history_cpu_pairs], ignore_index=True)
-        del raw_history, history_direct, history_ram_pairs, history_cpu_pairs
-
-        trend_direct = build_direct_trend(raw_trend, direct_items)
-        trend_ram_pairs = build_ram_pair_trend(raw_trend, ram_pairs)
-        trend_cpu_pairs = build_cpu_load_pair_trend(raw_trend, cpu_load_pairs)
-        trend_util = pd.concat([trend_direct, trend_ram_pairs, trend_cpu_pairs], ignore_index=True)
-        del raw_trend, trend_direct, trend_ram_pairs, trend_cpu_pairs
+        history_util = load_timeseries_csv(
+            history_util_path,
+            [
+                "metric",
+                "clock",
+                "hostid",
+                "host",
+                "as_value",
+                "itemid",
+                "utilization_pct",
+            ],
+        )
+        trend_util = load_timeseries_csv(
+            trend_util_path,
+            [
+                "metric",
+                "clock",
+                "hostid",
+                "host",
+                "as_value",
+                "itemid",
+                "num",
+                "util_min",
+                "util_avg",
+                "util_max",
+            ],
+        )
 
         if history_util.empty and trend_util.empty:
             raise SystemExit("No utilization data extracted from selected items.")
-
-        history_util_path = output_dir / f"history_exact_{cfg.HISTORY_DAYS}d.csv"
-        trend_util_path = output_dir / f"trend_{cfg.TREND_DAYS}d.csv"
-        save_csv(history_util, history_util_path)
-        save_csv(trend_util, trend_util_path)
         log(
             "Saved utilization checkpoints: "
-            f"{history_util_path.name}, {trend_util_path.name}"
+            f"{history_util_path.name}, {trend_util_path.name}, "
+            f"{history_features_path.name}, {trend_features_path.name}"
         )
 
         history_summary_all = summarize_history(history_util, by_as=False)
@@ -281,56 +379,47 @@ def main() -> int:
                     "host": item.host,
                     "as_value": item.as_value,
                     "metric": item.metric,
-                    "source": item.source,
+                    "source": "target",
+                    "feature": "",
+                    "entity": "",
                     "itemid": item.itemid,
                     "key_": item.key_,
                     "value_type": item.value_type,
                     "transform": item.transform,
                 }
             )
-        for pair in ram_pairs:
+        for item in feature_items:
             selection_rows.append(
                 {
-                    "hostid": pair.hostid,
-                    "host": pair.host,
-                    "as_value": pair.as_value,
-                    "metric": "ram",
-                    "source": "pair",
-                    "itemid": pair.part_itemid,
-                    "key_": f"{pair.mode}+total",
-                    "value_type": pair.part_value_type,
-                    "transform": pair.mode,
-                }
-            )
-        for pair in cpu_load_pairs:
-            selection_rows.append(
-                {
-                    "hostid": pair.hostid,
-                    "host": pair.host,
-                    "as_value": pair.as_value,
-                    "metric": "cpu",
-                    "source": "pair",
-                    "itemid": pair.load_itemid,
-                    "key_": f"{pair.load_key}+system.cpu.num",
-                    "value_type": pair.load_value_type,
-                    "transform": "load_over_cpu_num",
+                    "hostid": item.hostid,
+                    "host": item.host,
+                    "as_value": item.as_value,
+                    "metric": item.metric,
+                    "source": "feature",
+                    "feature": item.feature,
+                    "entity": item.entity,
+                    "itemid": item.itemid,
+                    "key_": item.key_,
+                    "value_type": item.value_type,
+                    "transform": item.transform,
                 }
             )
         selection_report = pd.DataFrame(selection_rows)
 
         log("Saving CSV artifacts...")
         save_csv(selection_report, output_dir / "selected_items.csv")
-        save_csv(history_summary_all, output_dir / f"history_summary_all_{cfg.HISTORY_DAYS}d.csv")
-        save_csv(history_summary_as, output_dir / f"history_summary_by_as_{cfg.HISTORY_DAYS}d.csv")
-        save_csv(trend_summary_all, output_dir / f"trend_summary_all_{cfg.TREND_DAYS}d.csv")
-        save_csv(trend_summary_as, output_dir / f"trend_summary_by_as_{cfg.TREND_DAYS}d.csv")
+        save_csv(history_summary_all, output_dir / f"history_summary_all_{history_window_label}.csv")
+        save_csv(history_summary_as, output_dir / f"history_summary_by_as_{history_window_label}.csv")
+        save_csv(trend_summary_all, output_dir / f"trend_summary_all_{trend_window_label}.csv")
+        save_csv(trend_summary_as, output_dir / f"trend_summary_by_as_{trend_window_label}.csv")
 
         selected_counts = {
-            "cpu_direct": cpu_direct_count,
-            "cpu_load_pair": cpu_load_pair_count,
-            "ram_direct": ram_direct_count,
-            "ram_pair": len(ram_pairs),
-            "disk_direct": disk_count,
+            "cpu_target": cpu_target_count,
+            "ram_target": ram_target_count,
+            "disk_target": disk_target_count,
+            "ram_features": ram_feature_count,
+            "disk_features": disk_feature_count,
+            "feature_total": feature_total_count,
         }
         conclusion = build_conclusion(
             run_at=now,
@@ -340,7 +429,7 @@ def main() -> int:
             trend_summary_all=trend_summary_all,
         )
 
-        xlsx_path = output_dir / f"summary_report_{cfg.HISTORY_DAYS}d_{cfg.TREND_DAYS}d.xlsx"
+        xlsx_path = output_dir / f"summary_report_{history_window_label}_{trend_window_label}.xlsx"
         save_xlsx(
             xlsx_path,
             {
@@ -361,7 +450,10 @@ def main() -> int:
             "as_tag_key": cfg.AS_TAG_KEY,
             "as_tag_values": as_values,
             "history_days": cfg.HISTORY_DAYS,
+            "history_mode": "all_available" if history_all_available else "fixed_days",
+            "history_window_label": history_window_label,
             "trend_days": cfg.TREND_DAYS,
+            "trend_window_label": trend_window_label,
             "host_count": len(hosts),
             "selected": {
                 **selected_counts,
@@ -393,7 +485,7 @@ def main() -> int:
                     history_raw=metric_history_raw,
                     history_summary=metric_history_summary,
                     trend_summary=metric_trend_summary,
-                    history_days=cfg.HISTORY_DAYS,
+                    history_window_label=history_window_label,
                     trend_days=cfg.TREND_DAYS,
                     output_file=plots_dir / f"{metric}_dashboard.png",
                 )

@@ -16,7 +16,7 @@ def plot_metric_dashboard(
     history_raw: pd.DataFrame,
     history_summary: pd.DataFrame,
     trend_summary: pd.DataFrame,
-    history_days: int,
+    history_window_label: str,
     trend_days: int,
     output_file: Path,
 ) -> None:
@@ -31,14 +31,14 @@ def plot_metric_dashboard(
         ax.plot(summary["clock"], summary["util_mean"], label="Mean", linewidth=1.7)
         ax.plot(summary["clock"], summary["util_median"], label="Median", linewidth=1.2, alpha=0.9)
         ax.plot(summary["clock"], summary["util_max"], label="Max", linewidth=1.0, alpha=0.6)
-        ax.set_title(f"{metric.upper()} exact data (last {history_days} days)")
+        ax.set_title(f"{metric.upper()} exact data ({history_window_label})")
         ax.set_ylabel("Utilization %")
         ax.legend(loc="upper left")
     else:
         ax.text(
             0.5,
             0.5,
-            f"No {history_days}-day exact data",
+            f"No exact data ({history_window_label})",
             ha="center",
             va="center",
             transform=ax.transAxes,

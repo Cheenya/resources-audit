@@ -32,6 +32,10 @@ pip install -r requirements.txt
 
 Заполните `config.py` перед запуском.
 
+`HISTORY_DAYS` поддерживает два режима:
+- `> 0` - фиксированное окно в днях (например `30`)
+- `0` - вся доступная история из `history` таблиц (без попытки дотянуть до фиксированного окна)
+
 ## Структура кода (4 файла)
 
 - `zabbix_utilization_pipeline.py` - оркестратор пайплайна: валидация конфига, запуск этапов, сохранение артефактов.
@@ -71,19 +75,21 @@ python3 zabbix_utilization_pipeline.py
 
 ## Что сохраняется
 
-В каталоге, указанном в `OUTPUT_DIR` (по умолчанию `output/`):
+В каталоге, указанном в `OUTPUT_DIR` (по умолчанию `output/`), где `<HISTORY_WINDOW>` это `30d` или `all`, а `<TREND_WINDOW>` это `365d`:
 
 - `selected_items.csv` - какие элементы выбраны для метрик
-- `history_raw_api_<HISTORY_DAYS>d.csv` - сырой ответ `history.get` после нормализации
-- `trend_raw_api_<TREND_DAYS>d.csv` - сырой ответ `trend.get` после нормализации
-- `history_exact_<HISTORY_DAYS>d.csv` - точные данные утилизации (host-level)
-- `trend_<TREND_DAYS>d.csv` - тренды утилизации (host-level)
-- `history_summary_all_<HISTORY_DAYS>d.csv` - суммаризация по всем выбранным хостам
-- `history_summary_by_as_<HISTORY_DAYS>d.csv` - суммаризация по AS
-- `trend_summary_all_<TREND_DAYS>d.csv` - суммаризация трендов по всем хостам
-- `trend_summary_by_as_<TREND_DAYS>d.csv` - суммаризация трендов по AS
+- `history_raw_api_<HISTORY_WINDOW>.csv` - сырой ответ `history.get` после нормализации
+- `trend_raw_api_<TREND_WINDOW>.csv` - сырой ответ `trend.get` после нормализации
+- `history_exact_<HISTORY_WINDOW>.csv` - точные данные утилизации (host-level)
+- `trend_<TREND_WINDOW>.csv` - тренды утилизации (host-level)
+- `history_features_<HISTORY_WINDOW>.csv` - дополнительные признаки для предикта (exact, host-level)
+- `trend_features_<TREND_WINDOW>.csv` - дополнительные признаки для предикта (trend, host-level)
+- `history_summary_all_<HISTORY_WINDOW>.csv` - суммаризация по всем выбранным хостам
+- `history_summary_by_as_<HISTORY_WINDOW>.csv` - суммаризация по AS
+- `trend_summary_all_<TREND_WINDOW>.csv` - суммаризация трендов по всем хостам
+- `trend_summary_by_as_<TREND_WINDOW>.csv` - суммаризация трендов по AS
 - `run_context.json` - параметры и метаинформация запуска
-- `summary_report_<HISTORY_DAYS>d_<TREND_DAYS>d.xlsx` - единый отчет:
+- `summary_report_<HISTORY_WINDOW>_<TREND_WINDOW>.xlsx` - единый отчет:
   - `selected_items`
   - `history_summary_all`
   - `history_summary_by_as`
@@ -94,7 +100,7 @@ python3 zabbix_utilization_pipeline.py
 В каталоге `<OUTPUT_DIR>/plots/`:
 
 - `<metric>_dashboard.png` для `cpu`, `ram`, `disk`:
-  - exact окно (`HISTORY_DAYS`): mean/median/p10-p90/max
+  - exact окно (`HISTORY_DAYS` или `all`): mean/median/p10-p90/max
   - trend окно (`TREND_DAYS`): mean + min/max envelope
   - host heatmap (daily mean)
 - `<metric>_by_as.png` - средняя утилизация по значениям тега `AS`
@@ -103,8 +109,10 @@ python3 zabbix_utilization_pipeline.py
 
 Сценарий автоматически подбирает стандартные ключи:
 
-- CPU: приоритет у `system.cpu.util[...,idle,...]` (берется `100 - idle`); если такого ключа нет, fallback на `system.cpu.load[all,avg*] / system.cpu.num`
-- RAM: `vm.memory.utilization*`, `vm.memory.size[pused]`, либо вычисление из пар `total + available/free/used`
-- Disk: `vfs.fs.size[<fs>,pused]`
+- CPU: используется только `system.cpu.util*`; приоритет у `system.cpu.util[...,idle,...]` (берется `100 - idle`)
+- RAM target: `100 - vm.memory.size[pavailable]`
+- RAM features: `vm.memory.size[pavailable]`, `vm.memory.size[pused]`, `vm.memory.size[available]/[free]`, `vm.memory.size[used]`, `vm.memory.size[total]`
+- Disk target: `vfs.fs.size[<fs>,pused]` (по приоритету `DISK_FS`)
+- Disk features: `vfs.fs.size[<fs>,used]`, `vfs.fs.size[<fs>,free]`, `vfs.fs.size[<fs>,total]` для того же выбранного `<fs>`
 
 Если в вашей инсталляции нестандартные item keys, потребуется адаптировать логику выбора в `processing.py`.
