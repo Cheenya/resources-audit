@@ -27,8 +27,10 @@ pip install -r requirements.txt
 - `HISTORY_DAYS`, `TREND_DAYS`, `FORECAST_DAYS`
 - `FORECAST_SOURCE`, `FORECAST_LOOKBACK_DAYS`
 - `FORECAST_KEY_CPU`, `FORECAST_KEY_RAM`, `FORECAST_KEY_DISK`
+- `CHECK_FORECAST_ONLY`
 - `DISK_FS`
-- `CHUNK_SIZE`, `REQUEST_TIMEOUT`, `VERIFY_SSL`
+- `CHUNK_SIZE`, `ITEM_CHUNK_SIZE`, `HISTORY_CHUNK_SIZE`, `TREND_CHUNK_SIZE`
+- `REQUEST_TIMEOUT`, `VERIFY_SSL`
 - `OUTPUT_DIR`
 - `PLOTS_ENABLED`
 
@@ -49,6 +51,12 @@ pip install -r requirements.txt
 - задайте `FORECAST_LOOKBACK_DAYS` (период истории этих forecast-item'ов для выгрузки).
 
 Если нативные forecast-item'ы не найдены или по ним нет данных, сценарий автоматически переключится на Python forecast.
+
+Для быстрой проверки forecast-item'ов без долгого сбора истории/трендов:
+
+- задайте `FORECAST_KEY_CPU/RAM/DISK`;
+- включите `CHECK_FORECAST_ONLY = True`;
+- запустите сценарий и проверьте `output/forecast_item_check.csv`.
 
 ## Структура кода (4 файла)
 
@@ -100,6 +108,7 @@ python3 zabbix_utilization_pipeline.py
 - `trend_summary_by_as_<TREND_DAYS>d.csv` - суммаризация трендов по AS
 - `forecast_<FORECAST_DAYS>d.csv` - прогноз утилизации
 - `run_context.json` - параметры и метаинформация запуска
+- `forecast_item_check.csv` - проверка forecast-item'ов (если заданы forecast-ключи)
 
 В каталоге `<OUTPUT_DIR>/plots/`:
 

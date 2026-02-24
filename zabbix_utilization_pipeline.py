@@ -26,6 +26,7 @@ from processing import (
     get_hosts_by_as,
     get_items_for_hosts,
     index_items_by_host,
+    inspect_native_forecast_items,
     parse_csv_values,
     pick_as_value,
     select_native_forecast_items,
@@ -61,6 +62,12 @@ def main() -> int:
     forecast_lookback_days = int(getattr(cfg, "FORECAST_LOOKBACK_DAYS", cfg.HISTORY_DAYS))
     if forecast_lookback_days <= 0:
         raise SystemExit("FORECAST_LOOKBACK_DAYS in config.py must be > 0.")
+    item_chunk_size = int(getattr(cfg, "ITEM_CHUNK_SIZE", cfg.CHUNK_SIZE))
+    history_chunk_size = int(getattr(cfg, "HISTORY_CHUNK_SIZE", cfg.CHUNK_SIZE))
+    trend_chunk_size = int(getattr(cfg, "TREND_CHUNK_SIZE", cfg.CHUNK_SIZE))
+    if item_chunk_size <= 0 or history_chunk_size <= 0 or trend_chunk_size <= 0:
+        raise SystemExit("ITEM_CHUNK_SIZE/HISTORY_CHUNK_SIZE/TREND_CHUNK_SIZE must be > 0.")
+    check_forecast_only = bool(getattr(cfg, "CHECK_FORECAST_ONLY", False))
 
     if cfg.VERIFY_SSL is False:
         log("Warning: TLS certificate verification is disabled (VERIFY_SSL=False).")
@@ -110,10 +117,37 @@ def main() -> int:
 
         hostids = list(host_meta.keys())
         log("Loading enabled items for matched hosts...")
-        items = get_items_for_hosts(api, hostids, chunk_size=cfg.CHUNK_SIZE)
+        items = get_items_for_hosts(api, hostids, chunk_size=item_chunk_size)
         log(f"Loaded items: {len(items)}")
 
         items_by_host = index_items_by_host(items)
+        native_forecast_keys = {
+            "cpu": str(getattr(cfg, "FORECAST_KEY_CPU", "")).strip(),
+            "ram": str(getattr(cfg, "FORECAST_KEY_RAM", "")).strip(),
+            "disk": str(getattr(cfg, "FORECAST_KEY_DISK", "")).strip(),
+        }
+        configured_forecast_metrics = [metric for metric, key_ in native_forecast_keys.items() if key_]
+        forecast_check = pd.DataFrame()
+        if configured_forecast_metrics:
+            forecast_check = inspect_native_forecast_items(
+                items_by_host=items_by_host,
+                host_meta=host_meta,
+                key_map=native_forecast_keys,
+            )
+            found = int(forecast_check["found"].sum()) if not forecast_check.empty else 0
+            has_expr = int(forecast_check["has_forecast_expr"].sum()) if not forecast_check.empty else 0
+            log(
+                "Forecast item check: "
+                f"configured={len(configured_forecast_metrics)}, found={found}, with forecast() expr={has_expr}"
+            )
+            save_csv(forecast_check, output_dir / "forecast_item_check.csv")
+            if check_forecast_only:
+                log("CHECK_FORECAST_ONLY=True: skipping history/trend collection.")
+                return 0
+        elif check_forecast_only:
+            log("CHECK_FORECAST_ONLY=True but forecast keys are empty; nothing to check.")
+            return 0
+
         direct_items, ram_pairs = select_items(items_by_host, host_meta, disk_fs_preferences)
 
         cpu_count = len([item for item in direct_items if item.metric == "cpu"])
@@ -150,7 +184,7 @@ def main() -> int:
             itemid_to_value_type=history_itemids,
             time_from=history_from,
             time_till=time_till,
-            chunk_size=cfg.CHUNK_SIZE,
+            chunk_size=history_chunk_size,
         )
         log(f"Exact datapoints: {len(raw_history)}")
 
@@ -160,7 +194,7 @@ def main() -> int:
             itemids=trend_itemids,
             time_from=trend_from,
             time_till=time_till,
-            chunk_size=cfg.CHUNK_SIZE,
+            chunk_size=trend_chunk_size,
         )
         log(f"Trend datapoints: {len(raw_trend)}")
 
@@ -180,11 +214,6 @@ def main() -> int:
         trend_summary_all = summarize_trend(trend_util, by_as=False)
         trend_summary_as = summarize_trend(trend_util, by_as=True)
 
-        native_forecast_keys = {
-            "cpu": str(getattr(cfg, "FORECAST_KEY_CPU", "")).strip(),
-            "ram": str(getattr(cfg, "FORECAST_KEY_RAM", "")).strip(),
-            "disk": str(getattr(cfg, "FORECAST_KEY_DISK", "")).strip(),
-        }
         native_forecast_items = []
         forecast = pd.DataFrame(
             columns=["metric", "timestamp", "is_future", "actual", "fitted", "predicted", "lower", "upper"]
@@ -195,10 +224,9 @@ def main() -> int:
                 host_meta=host_meta,
                 key_map=native_forecast_keys,
             )
-            configured_metrics = [metric for metric, key_ in native_forecast_keys.items() if key_]
             log(
                 "Native forecast mode: "
-                f"configured metrics={len(configured_metrics)}, selected items={len(native_forecast_items)}"
+                f"configured metrics={len(configured_forecast_metrics)}, selected items={len(native_forecast_items)}"
             )
             if native_forecast_items:
                 native_itemid_to_type = {item.itemid: item.value_type for item in native_forecast_items}
@@ -212,7 +240,7 @@ def main() -> int:
                     itemid_to_value_type=native_itemid_to_type,
                     time_from=native_from,
                     time_till=time_till,
-                    chunk_size=cfg.CHUNK_SIZE,
+                    chunk_size=history_chunk_size,
                 )
                 log(f"Native forecast datapoints: {len(raw_native_forecast)}")
                 forecast = build_native_forecast(
@@ -310,8 +338,12 @@ def main() -> int:
             },
             "verify_ssl": cfg.VERIFY_SSL,
             "chunk_size": cfg.CHUNK_SIZE,
+            "item_chunk_size": item_chunk_size,
+            "history_chunk_size": history_chunk_size,
+            "trend_chunk_size": trend_chunk_size,
             "request_timeout": cfg.REQUEST_TIMEOUT,
             "plots_enabled": plots_enabled,
+            "check_forecast_only": check_forecast_only,
         }
         with (output_dir / "run_context.json").open("w", encoding="utf-8") as file:
             json.dump(context, file, indent=2, ensure_ascii=False)

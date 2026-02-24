@@ -109,11 +109,22 @@ def get_hosts_by_as(
 def get_items_for_hosts(
     api: ZabbixAPI, hostids: Sequence[str], chunk_size: int
 ) -> List[Dict]:
-    fields = ["itemid", "hostid", "name", "key_", "value_type", "status", "units"]
+    fields = [
+        "itemid",
+        "hostid",
+        "name",
+        "key_",
+        "value_type",
+        "status",
+        "units",
+        "type",
+        "params",
+    ]
     all_items: List[Dict] = []
     queue = deque(chunked(list(hostids), chunk_size))
     total_chunks = len(queue)
     completed_chunks = 0
+    progress_bar("item.get", 0, total_chunks)
     while queue:
         host_chunk = queue.popleft()
         params = {
@@ -368,6 +379,69 @@ def select_items(
     return direct, ram_pairs
 
 
+def inspect_native_forecast_items(
+    items_by_host: Dict[str, List[Dict]],
+    host_meta: Dict[str, Dict[str, str]],
+    key_map: Dict[str, str],
+) -> pd.DataFrame:
+    rows: List[Dict] = []
+    for hostid, host_info in host_meta.items():
+        host_items = items_by_host.get(hostid, [])
+        key_to_item = {item.get("key_", ""): item for item in host_items}
+        for metric, raw_key in key_map.items():
+            key_ = raw_key.strip()
+            if not key_:
+                continue
+            item = key_to_item.get(key_)
+            if item is None:
+                rows.append(
+                    {
+                        "hostid": hostid,
+                        "host": host_info.get("host", ""),
+                        "as_value": host_info.get("as_value", ""),
+                        "metric": metric,
+                        "key_": key_,
+                        "found": False,
+                        "itemid": "",
+                        "item_type": "",
+                        "has_forecast_expr": False,
+                        "params": "",
+                    }
+                )
+                continue
+            params = str(item.get("params", "") or "")
+            rows.append(
+                {
+                    "hostid": hostid,
+                    "host": host_info.get("host", ""),
+                    "as_value": host_info.get("as_value", ""),
+                    "metric": metric,
+                    "key_": key_,
+                    "found": True,
+                    "itemid": str(item.get("itemid", "")),
+                    "item_type": str(item.get("type", "")),
+                    "has_forecast_expr": "forecast(" in params.lower(),
+                    "params": params,
+                }
+            )
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "hostid",
+                "host",
+                "as_value",
+                "metric",
+                "key_",
+                "found",
+                "itemid",
+                "item_type",
+                "has_forecast_expr",
+                "params",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
 def select_native_forecast_items(
     items_by_host: Dict[str, List[Dict]],
     host_meta: Dict[str, Dict[str, str]],
@@ -425,6 +499,7 @@ def fetch_history_points(
     queue = deque(request_plan)
     total_chunks = len(queue)
     completed_chunks = 0
+    progress_bar("history.get", 0, total_chunks)
     while queue:
         value_type, item_chunk, window_from, window_till = queue.popleft()
         params = {
@@ -519,6 +594,7 @@ def fetch_trend_points(
     )
     total_chunks = len(queue)
     completed_chunks = 0
+    progress_bar("trend.get", 0, total_chunks)
     while queue:
         item_chunk, window_from, window_till = queue.popleft()
         params = {
