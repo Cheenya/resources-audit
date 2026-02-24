@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import math
 import re
 import sys
@@ -171,6 +172,23 @@ def ram_direct_score(item: Dict) -> int:
 
 
 DISK_PUSED_RE = re.compile(r"^vfs\.fs\.size\[(?P<fs>[^,]+),pused\]$")
+TRANSIENT_API_ERROR_PATTERNS = (
+    "gateway timeout",
+    "gateway time-out",
+    "bad gateway",
+    "read timed out",
+    "connect timeout",
+    "timed out",
+    "status 429",
+    "status 502",
+    "status 503",
+    "status 504",
+)
+
+
+def is_transient_api_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(pattern in message for pattern in TRANSIENT_API_ERROR_PATTERNS)
 
 
 def disk_score(item: Dict, fs_preferences: Sequence[str]) -> Tuple[int, str]:
@@ -331,8 +349,11 @@ def fetch_history_points(
         for item_chunk in chunked(itemids, chunk_size):
             request_plan.append((value_type, item_chunk))
 
-    total_chunks = len(request_plan)
-    for idx, (value_type, item_chunk) in enumerate(request_plan, start=1):
+    queue = deque(request_plan)
+    total_chunks = len(queue)
+    completed_chunks = 0
+    while queue:
+        value_type, item_chunk = queue.popleft()
         params = {
             "output": ["itemid", "clock", "ns", "value"],
             "history": value_type,
@@ -342,11 +363,30 @@ def fetch_history_points(
             "sortfield": "clock",
             "sortorder": "ASC",
         }
-        records = api.call("history.get", params)
+        try:
+            records = api.call("history.get", params)
+        except Exception as exc:
+            if len(item_chunk) > 1 and is_transient_api_error(exc):
+                midpoint = len(item_chunk) // 2
+                left_chunk = item_chunk[:midpoint]
+                right_chunk = item_chunk[midpoint:]
+                if left_chunk and right_chunk:
+                    print(
+                        f"\nhistory.get: transient failure on chunk size {len(item_chunk)}, "
+                        f"splitting into {len(left_chunk)} + {len(right_chunk)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    queue.appendleft((value_type, right_chunk))
+                    queue.appendleft((value_type, left_chunk))
+                    total_chunks += 1
+                    continue
+            raise
         if records:
             frame = pd.DataFrame.from_records(records)
             frames.append(frame)
-        progress_bar("history.get", idx, total_chunks)
+        completed_chunks += 1
+        progress_bar("history.get", completed_chunks, total_chunks)
 
     if not frames:
         return pd.DataFrame(columns=["itemid", "clock", "value", "ns"])
@@ -373,9 +413,11 @@ def fetch_trend_points(
 
     frames: List[pd.DataFrame] = []
     unique_itemids = sorted(set(itemids))
-    item_chunks = list(chunked(unique_itemids, chunk_size))
-    total_chunks = len(item_chunks)
-    for idx, item_chunk in enumerate(item_chunks, start=1):
+    queue = deque(chunked(unique_itemids, chunk_size))
+    total_chunks = len(queue)
+    completed_chunks = 0
+    while queue:
+        item_chunk = queue.popleft()
         params = {
             "output": ["itemid", "clock", "num", "value_min", "value_avg", "value_max"],
             "itemids": item_chunk,
@@ -384,10 +426,29 @@ def fetch_trend_points(
             "sortfield": "clock",
             "sortorder": "ASC",
         }
-        records = api.call("trend.get", params)
+        try:
+            records = api.call("trend.get", params)
+        except Exception as exc:
+            if len(item_chunk) > 1 and is_transient_api_error(exc):
+                midpoint = len(item_chunk) // 2
+                left_chunk = item_chunk[:midpoint]
+                right_chunk = item_chunk[midpoint:]
+                if left_chunk and right_chunk:
+                    print(
+                        f"\ntrend.get: transient failure on chunk size {len(item_chunk)}, "
+                        f"splitting into {len(left_chunk)} + {len(right_chunk)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    queue.appendleft(right_chunk)
+                    queue.appendleft(left_chunk)
+                    total_chunks += 1
+                    continue
+            raise
         if records:
             frames.append(pd.DataFrame.from_records(records))
-        progress_bar("trend.get", idx, total_chunks)
+        completed_chunks += 1
+        progress_bar("trend.get", completed_chunks, total_chunks)
 
     if not frames:
         return pd.DataFrame(
