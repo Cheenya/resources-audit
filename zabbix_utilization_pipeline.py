@@ -19,7 +19,6 @@ from processing import (
     build_direct_trend,
     build_feature_history,
     build_feature_trend,
-    fetch_history_points,
     fetch_trend_points,
     get_hosts_by_as,
     get_items_for_hosts,
@@ -233,10 +232,6 @@ def main() -> int:
         direct_itemid_to_type = {item.itemid: item.value_type for item in direct_items}
         feature_itemid_to_type = {item.itemid: item.value_type for item in feature_items}
 
-        history_itemids = {
-            **direct_itemid_to_type,
-            **feature_itemid_to_type,
-        }
         trend_itemids = sorted(
             set(
                 list(direct_itemid_to_type.keys())
@@ -264,45 +259,22 @@ def main() -> int:
         history_raw_count = 0
         history_util_count = 0
         history_feature_count = 0
-
-        def on_history_chunk(chunk: pd.DataFrame) -> None:
-            nonlocal history_raw_count, history_util_count, history_feature_count
-            history_raw_count += len(chunk)
-            append_csv(chunk, history_raw_path)
-
-            util_chunk = build_direct_history(chunk, direct_items)
-            history_util_count += len(util_chunk)
-            append_csv(util_chunk, history_util_path)
-
-            feature_chunk = build_feature_history(chunk, feature_items)
-            history_feature_count += len(feature_chunk)
-            append_csv(feature_chunk, history_features_path)
-
-        if history_all_available:
-            log("Collecting all available exact history from history.get...")
-        else:
-            log(f"Collecting {cfg.HISTORY_DAYS}-day exact history from history.get...")
-        fetch_history_points(
-            api,
-            itemid_to_value_type=history_itemids,
-            time_from=history_from,
-            time_till=time_till,
-            chunk_size=history_chunk_size,
-            on_chunk=on_history_chunk,
-            collect=False,
-        )
-        log(
-            f"Exact datapoints: raw={history_raw_count}, "
-            f"target={history_util_count}, features={history_feature_count}"
-        )
-        log(f"Saved raw history API data: {history_raw_path.name}")
-
         trend_raw_count = 0
         trend_util_count = 0
         trend_feature_count = 0
+        history_cutoff = (
+            None
+            if history_all_available
+            else pd.Timestamp.fromtimestamp(history_from, tz=timezone.utc)
+        )
 
         def on_trend_chunk(chunk: pd.DataFrame) -> None:
-            nonlocal trend_raw_count, trend_util_count, trend_feature_count
+            nonlocal trend_raw_count
+            nonlocal trend_util_count
+            nonlocal trend_feature_count
+            nonlocal history_raw_count
+            nonlocal history_util_count
+            nonlocal history_feature_count
             trend_raw_count += len(chunk)
             append_csv(chunk, trend_raw_path)
 
@@ -314,7 +286,35 @@ def main() -> int:
             trend_feature_count += len(feature_chunk)
             append_csv(feature_chunk, trend_features_path)
 
-        log(f"Collecting {cfg.TREND_DAYS}-day trend data from trend.get...")
+            history_source = chunk if history_cutoff is None else chunk[chunk["clock"] >= history_cutoff]
+            if history_source.empty:
+                return
+
+            history_chunk = history_source[["itemid", "clock", "value_avg"]].rename(
+                columns={"value_avg": "value"}
+            )
+            history_chunk["ns"] = 0
+            history_raw_count += len(history_chunk)
+            append_csv(history_chunk, history_raw_path)
+
+            history_util_chunk = build_direct_history(history_chunk, direct_items)
+            history_util_count += len(history_util_chunk)
+            append_csv(history_util_chunk, history_util_path)
+
+            history_feature_chunk = build_feature_history(history_chunk, feature_items)
+            history_feature_count += len(history_feature_chunk)
+            append_csv(history_feature_chunk, history_features_path)
+
+        if history_all_available:
+            log(
+                "Collecting trend data once and deriving all available exact history "
+                "from trend averages..."
+            )
+        else:
+            log(
+                f"Collecting trend data once and deriving {cfg.HISTORY_DAYS}-day exact "
+                "history from trend averages..."
+            )
         fetch_trend_points(
             api,
             itemids=trend_itemids,
@@ -329,6 +329,11 @@ def main() -> int:
             f"target={trend_util_count}, features={trend_feature_count}"
         )
         log(f"Saved raw trend API data: {trend_raw_path.name}")
+        log(
+            f"Derived exact datapoints: raw={history_raw_count}, "
+            f"target={history_util_count}, features={history_feature_count}"
+        )
+        log(f"Saved derived history data: {history_raw_path.name}")
 
         history_util = load_timeseries_csv(
             history_util_path,
@@ -452,6 +457,7 @@ def main() -> int:
             "history_days": cfg.HISTORY_DAYS,
             "history_mode": "all_available" if history_all_available else "fixed_days",
             "history_window_label": history_window_label,
+            "history_source": "trend.value_avg",
             "trend_days": cfg.TREND_DAYS,
             "trend_window_label": trend_window_label,
             "host_count": len(hosts),

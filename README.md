@@ -2,8 +2,8 @@
 
 Сценарий собирает утилизацию `CPU`, `RAM`, `Disk` по хостам, отфильтрованным по тегу `AS`, затем:
 
-- выгружает точные данные за последние 30 дней (`history.get`);
-- выгружает тренды за год (`trend.get`);
+- выгружает часовые тренды (`trend.get`);
+- формирует "exact" окно из trend average (без поминутной выгрузки `history.get`);
 - делает суммаризацию по всем хостам и по значениям тега `AS`;
 - сохраняет детальные plot-схемы.
 
@@ -34,7 +34,7 @@ pip install -r requirements.txt
 
 `HISTORY_DAYS` поддерживает два режима:
 - `> 0` - фиксированное окно в днях (например `30`)
-- `0` - вся доступная история из `history` таблиц (без попытки дотянуть до фиксированного окна)
+- `0` - всё доступное окно, которое пришло из `trend.get` (обычно `TREND_DAYS`)
 
 ## Структура кода (4 файла)
 
@@ -49,7 +49,7 @@ pip install -r requirements.txt
 python3 zabbix_utilization_pipeline.py
 ```
 
-Во время `item.get`, `history.get` и `trend.get` выводится прогресс-бар по чанкам API.
+Во время `item.get` и `trend.get` выводится прогресс-бар по чанкам API.
 
 Если на машине не импортируется `matplotlib.pyplot`:
 
@@ -67,7 +67,7 @@ python3 zabbix_utilization_pipeline.py
 - убедитесь, что на машине корректная цепочка доверенных сертификатов;
 - `VERIFY_SSL = False` используйте только как временный обход для теста.
 
-Если видите `Gateway Time-out` (`504`) на `history.get`/`trend.get`:
+Если видите `Gateway Time-out` (`504`) на `trend.get`:
 
 - сценарий автоматически повторяет запрос и дробит проблемный запрос по `itemids` и по времени;
 - при повторных сбоях на минимальном временном окне сценарий пропускает только этот маленький участок и продолжает сбор;
@@ -78,7 +78,7 @@ python3 zabbix_utilization_pipeline.py
 В каталоге, указанном в `OUTPUT_DIR` (по умолчанию `output/`), где `<HISTORY_WINDOW>` это `30d` или `all`, а `<TREND_WINDOW>` это `365d`:
 
 - `selected_items.csv` - какие элементы выбраны для метрик
-- `history_raw_api_<HISTORY_WINDOW>.csv` - сырой ответ `history.get` после нормализации
+- `history_raw_api_<HISTORY_WINDOW>.csv` - "exact" ряд, полученный из `trend.value_avg`
 - `trend_raw_api_<TREND_WINDOW>.csv` - сырой ответ `trend.get` после нормализации
 - `history_exact_<HISTORY_WINDOW>.csv` - точные данные утилизации (host-level)
 - `trend_<TREND_WINDOW>.csv` - тренды утилизации (host-level)
