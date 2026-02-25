@@ -5,6 +5,9 @@
 - выгружает часовые тренды (`trend.get`);
 - формирует "exact" окно из trend average (без поминутной выгрузки `history.get`);
 - делает суммаризацию по всем хостам и по значениям тега `AS`;
+- считает host-level risk-метрики (`p50/p95/p99`, `duty_cycle_80/90`, `burstiness`, `volatility`, `cold/warm/hot`);
+- строит per-host/per-metric прогноз daily `p95` утилизации на горизонты `30/90` (модельный отбор по rolling backtest);
+- формирует actionable-статусы (`critical/watch/stable/overprovisioned`);
 - сохраняет детальные plot-схемы.
 
 ## Установка
@@ -29,6 +32,12 @@ pip install -r requirements.txt
 - `REQUEST_TIMEOUT`, `VERIFY_SSL`
 - `OUTPUT_DIR`
 - `PLOTS_ENABLED`
+- `FORECAST_ENABLED`
+- `FORECAST_HORIZONS`
+- `FORECAST_BACKTEST_HORIZON_DAYS`
+- `FORECAST_BACKTEST_FOLDS`
+- `FORECAST_MIN_TRAIN_DAYS`
+- `FORECAST_MAX_PLOTS`
 
 Заполните `config.py` перед запуском.
 
@@ -36,12 +45,13 @@ pip install -r requirements.txt
 - `> 0` - фиксированное окно в днях (например `30`)
 - `0` - всё доступное окно, которое пришло из `trend.get` (обычно `TREND_DAYS`)
 
-## Структура кода (4 файла)
+## Структура кода
 
 - `zabbix_utilization_pipeline.py` - оркестратор пайплайна: валидация конфига, запуск этапов, сохранение артефактов.
 - `zabbix_client.py` - JSON-RPC клиент Zabbix API (login/call/logout, обработка ошибок).
 - `processing.py` - выбор item'ов, загрузка `history/trend`, трансформации и суммаризация.
 - `plotting.py` - построение dashboard-графиков и разреза по `AS`.
+- `forecasting.py` - risk-метрики, rolling backtest, выбор модели, прогноз и actionable-рекомендации.
 
 ## Запуск
 
@@ -49,7 +59,7 @@ pip install -r requirements.txt
 python3 zabbix_utilization_pipeline.py
 ```
 
-Во время `item.get` и `trend.get` выводится прогресс-бар по чанкам API.
+Во время `item.get`, `trend.get` и этапа forecast выводится прогресс-бар.
 
 Если на машине не импортируется `matplotlib.pyplot`:
 
@@ -88,6 +98,12 @@ python3 zabbix_utilization_pipeline.py
 - `history_summary_by_as_<HISTORY_WINDOW>.csv` - суммаризация по AS
 - `trend_summary_all_<TREND_WINDOW>.csv` - суммаризация трендов по всем хостам
 - `trend_summary_by_as_<TREND_WINDOW>.csv` - суммаризация трендов по AS
+- `daily_target_p95_<HISTORY_WINDOW>.csv` - дневная целевая серия (`daily p95`) для прогноза
+- `host_risk_metrics_<HISTORY_WINDOW>.csv` - risk-метрики по host/metric (`p50/p95/p99`, `duty_cycle`, `burstiness`, `volatility`, `cluster`)
+- `model_backtest.csv` - качество моделей на rolling backtest (`WAPE`, `MAE`, `pinball_p90`, `calibration_p90`)
+- `model_selection.csv` - выбранная модель на каждый host/metric
+- `forecast_daily.csv` - прогноз на каждый день горизонта (`p50`, `p90`, `p95`)
+- `actionable_recommendations.csv` - итоговые статусы и рекомендации (`critical/watch/stable/overprovisioned`)
 - `run_context.json` - параметры и метаинформация запуска
 - `summary_report_<HISTORY_WINDOW>_<TREND_WINDOW>.xlsx` - единый отчет:
   - `selected_items`
@@ -95,7 +111,13 @@ python3 zabbix_utilization_pipeline.py
   - `history_summary_by_as`
   - `trend_summary_all`
   - `trend_summary_by_as`
-  - `conclusion` (краткое заключение по статусам и трендам)
+  - `daily_target_p95`
+  - `host_risk_metrics`
+  - `model_backtest`
+  - `model_selection`
+  - `forecast_daily`
+  - `actionable`
+  - `conclusion` (включая сводку по `critical/watch/stable/overprovisioned`)
 
 В каталоге `<OUTPUT_DIR>/plots/`:
 
@@ -104,6 +126,21 @@ python3 zabbix_utilization_pipeline.py
   - trend окно (`TREND_DAYS`): mean + min/max envelope
   - host heatmap (daily mean)
 - `<metric>_by_as.png` - средняя утилизация по значениям тега `AS`
+- `forecasts/<metric>_<host>_<hostid>.png` - forecast-кривые (`history daily p95` + `p50/p90/p95`, пороги `80/90/95`) для top-risk хостов
+
+## Логика предикта
+
+- Цель: `daily p95 utilization` на host/metric.
+- Горизонты: из `FORECAST_HORIZONS` (по умолчанию `30,90`).
+- Модели: `seasonal_naive` (неделя-к-неделе), `robust_trend` (робастный линейный тренд + недельная сезонность), `gbdt_lag` (градиентный бустинг по лагам/окнам).
+- Отбор: лучшая модель выбирается по rolling backtest.
+- Метрики качества: `WAPE`, `MAE`, `pinball_p90`, `calibration_p90`.
+- Для `hot` риск оценивается по консервативным кривым (`p90/p95`), для остальных по `p50`.
+- Actionable-статусы:
+  - `critical`: пересечение `90%` менее чем через `30` дней.
+  - `watch`: пересечение `90%` в диапазоне `30-90` дней.
+  - `stable`: пересечение позже `90` дней или не ожидается на горизонте.
+  - `overprovisioned`: стабильно низкая утилизация (`cold` + низкий `p95`).
 
 ## Замечания по ключам Zabbix
 

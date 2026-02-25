@@ -122,3 +122,42 @@ def plot_as_breakdown(
     ax.tick_params(axis="x", rotation=25)
     fig.savefig(output_file, dpi=140)
     plt.close(fig)
+
+
+def plot_host_forecast(
+    metric: str,
+    host: str,
+    history_daily: pd.DataFrame,
+    forecast_daily: pd.DataFrame,
+    output_file: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(14, 6), constrained_layout=True)
+
+    if not history_daily.empty:
+        history_plot = history_daily.sort_values("date")
+        ax.plot(
+            history_plot["date"],
+            history_plot["target_p95"],
+            label="History daily p95",
+            linewidth=1.5,
+            alpha=0.9,
+        )
+
+    if not forecast_daily.empty:
+        forecast_plot = forecast_daily.sort_values("date")
+        ax.plot(forecast_plot["date"], forecast_plot["p50"], label="Forecast p50", linewidth=1.8)
+        ax.plot(forecast_plot["date"], forecast_plot["p90"], label="Forecast p90", linewidth=1.2)
+        ax.plot(forecast_plot["date"], forecast_plot["p95"], label="Forecast p95", linewidth=1.0, alpha=0.9)
+
+    ax.axhline(80.0, color="#d6a800", linestyle="--", linewidth=1.0, label="80%")
+    ax.axhline(90.0, color="#d45f00", linestyle="--", linewidth=1.0, label="90%")
+    ax.axhline(95.0, color="#b30000", linestyle="--", linewidth=1.0, label="95%")
+
+    ax.set_title(f"{metric.upper()} forecast risk curve: {host}")
+    ax.set_ylabel("Utilization %")
+    ax.set_ylim(0.0, 100.0)
+    ax.grid(alpha=0.3)
+    ax.tick_params(axis="x", rotation=25)
+    ax.legend(loc="upper left", ncol=3, fontsize=8)
+    fig.savefig(output_file, dpi=140)
+    plt.close(fig)
