@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import sys
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -55,13 +55,6 @@ def _first_crossing_days(
     crossing_date = hit["date"].iloc[0]
     days = int((crossing_date - first_date).days + 1)
     return days, crossing_date
-
-
-def _quantile(values: Iterable[float], q: float) -> float:
-    arr = np.asarray(list(values), dtype=float)
-    if arr.size == 0:
-        return float("nan")
-    return float(np.quantile(arr, q))
 
 
 def build_daily_p95_target(history_util: pd.DataFrame) -> pd.DataFrame:
@@ -521,10 +514,6 @@ def run_host_metric_forecasts(
             key_values = dict(zip(group_columns, group_key))
         else:
             key_values = {group_columns[0]: group_key}
-        metric = str(key_values["metric"])
-        hostid = str(key_values["hostid"])
-        host = str(key_values["host"])
-        as_value = str(key_values["as_value"])
         series = (
             group.sort_values("date")
             .set_index("date")["target_p95"]

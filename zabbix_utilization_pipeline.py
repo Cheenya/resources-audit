@@ -1001,14 +1001,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 .max()
             )
             actionable_df = actionable_df.merge(confidence_frame, on=merge_keys, how="left")
-            for horizon in forecast_horizons:
-                horizon_frame = (
-                    risk_probabilities[risk_probabilities["horizon_days"] == int(horizon)][
-                        [*merge_keys, "prob_cross_adjusted_pct"]
-                    ]
-                    .rename(columns={"prob_cross_adjusted_pct": f"prob_cross_90_{int(horizon)}d_pct"})
+            probability_wide = (
+                risk_probabilities.pivot_table(
+                    index=merge_keys,
+                    columns="horizon_days",
+                    values="prob_cross_adjusted_pct",
+                    aggfunc="max",
                 )
-                actionable_df = actionable_df.merge(horizon_frame, on=merge_keys, how="left")
+                .reset_index()
+            )
+            renamed_columns = []
+            for column in probability_wide.columns:
+                column_name = str(column)
+                if column_name in merge_keys:
+                    renamed_columns.append(column_name)
+                    continue
+                try:
+                    horizon_value = int(column)
+                except (TypeError, ValueError):
+                    renamed_columns.append(column_name)
+                    continue
+                renamed_columns.append(f"prob_cross_90_{horizon_value}d_pct")
+            probability_wide.columns = renamed_columns
+            actionable_df = actionable_df.merge(probability_wide, on=merge_keys, how="left")
 
         log("Saving CSV artifacts...")
         save_csv(history_util, history_util_path)
