@@ -26,11 +26,12 @@ pip install -r requirements.txt
 - `ZABBIX_USERNAME`
 - `ZABBIX_PASSWORD`
 - `AS_TAG_KEY`, `AS_TAG_VALUES`, `TAG_OPERATOR`
+- `ENV_TAG_KEY`
 - `HISTORY_DAYS`, `TREND_DAYS`
 - `DISK_FS`
 - `CHUNK_SIZE`, `ITEM_CHUNK_SIZE`, `HISTORY_CHUNK_SIZE`, `TREND_CHUNK_SIZE`
 - `REQUEST_TIMEOUT`, `VERIFY_SSL`
-- `OUTPUT_DIR`
+- `OUTPUT_DIR`, `CSV_SUBDIR`, `XLSX_SUBDIR`
 - `PLOTS_ENABLED`
 - `FORECAST_ENABLED`
 - `FORECAST_HORIZONS`
@@ -68,9 +69,9 @@ python3 zabbix_utilization_pipeline.py --analysis-only
 ```
 
 В этом режиме API Zabbix не вызывается; используются уже существующие файлы в `OUTPUT_DIR`:
-- `history_exact_<HISTORY_WINDOW>.csv`
-- `trend_<TREND_WINDOW>.csv`
-- `selected_items.csv` (если есть)
+- `csv/history_exact_<HISTORY_WINDOW>.csv`
+- `csv/trend_<TREND_WINDOW>.csv`
+- `csv/selected_items.csv` (если есть)
 
 Если на машине не импортируется `matplotlib.pyplot`:
 
@@ -96,7 +97,22 @@ python3 zabbix_utilization_pipeline.py --analysis-only
 
 ## Что сохраняется
 
-В каталоге, указанном в `OUTPUT_DIR` (по умолчанию `output/`), где `<HISTORY_WINDOW>` это `30d` или `all`, а `<TREND_WINDOW>` это `365d`:
+В каталоге `OUTPUT_DIR` (по умолчанию `output/`) формируется общая папка и разрез по областям:
+
+- `output/csv/`, `output/xlsx/`, `output/plots/` - общие артефакты по всем AS
+- `output/<AS>/<prod|non-prod>/csv/` - CSV по конкретной AS и окружению
+- `output/<AS>/<prod|non-prod>/xlsx/` - XLSX-отчет по конкретной AS и окружению
+- `output/<AS>/<prod|non-prod>/conclusion.txt` - текстовое заключение по рискам
+
+Где `prod` определяется по тегу `ENV` (`ENV_TAG_KEY`) со значением `prod`, а всё остальное попадает в `non-prod`.
+
+В `csv/` (и аналогично внутри каждой scope-папки):
+
+- папка `csv/` - все табличные выгрузки CSV
+- папка `xlsx/` - итоговый Excel-отчет
+- папка `plots/` - графики
+
+В папке `csv/`:
 
 - `selected_items.csv` - какие элементы выбраны для метрик
 - `history_raw_api_<HISTORY_WINDOW>.csv` - "exact" ряд, полученный из `trend.value_avg`
@@ -114,8 +130,11 @@ python3 zabbix_utilization_pipeline.py --analysis-only
 - `model_backtest.csv` - качество моделей на rolling backtest (`WAPE`, `MAE`, `pinball_p90`, `calibration_p90`)
 - `model_selection.csv` - выбранная модель на каждый host/metric
 - `forecast_daily.csv` - прогноз на каждый день горизонта (`p50`, `p90`, `p95`)
+- `risk_probabilities.csv` - вероятность сценария пересечения порога 90% по горизонтам + индекс доверия
 - `actionable_recommendations.csv` - итоговые статусы и рекомендации (`critical/watch/stable/overprovisioned`)
-- `run_context.json` - параметры и метаинформация запуска
+- `run_context.json` - параметры и метаинформация запуска (в корне `OUTPUT_DIR`)
+
+В папке `xlsx/`:
 - `summary_report_<HISTORY_WINDOW>_<TREND_WINDOW>.xlsx` - единый отчет:
   - `selected_items`
   - `history_summary_all`
@@ -142,10 +161,17 @@ python3 zabbix_utilization_pipeline.py --analysis-only
 ## Логика предикта
 
 - Цель: `daily p95 utilization` на host/metric.
-- Горизонты: из `FORECAST_HORIZONS` (по умолчанию `30,90`).
+- Горизонты: из `FORECAST_HORIZONS` (по умолчанию `30,90,180,365`).
 - Модели: `seasonal_naive` (неделя-к-неделе), `robust_trend` (робастный линейный тренд + недельная сезонность), `gbdt_lag` (градиентный бустинг по лагам/окнам).
 - Отбор: лучшая модель выбирается по rolling backtest.
 - Метрики качества: `WAPE`, `MAE`, `pinball_p90`, `calibration_p90`.
+- Для каждого горизонта считается вероятность сценария пересечения 90% и индекс доверия прогноза (на базе качества backtest).
+- Для каждой AS и ENV-группы формируется текстовое заключение с секциями:
+  - критично сейчас (<= 30 дней),
+  - критично скоро (31-90 дней),
+  - риск в 6 месяцев (91-180 дней),
+  - риск в 12 месяцев (181-365 дней),
+  - стабильные и overprovisioned.
 - Для `hot` риск оценивается по консервативным кривым (`p90/p95`), для остальных по `p50`.
 - Actionable-статусы:
   - `critical`: пересечение `90%` менее чем через `30` дней.

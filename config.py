@@ -9,6 +9,7 @@ ZABBIX_PASSWORD = "zabbix_password"
 AS_TAG_KEY = "AS"
 AS_TAG_VALUES = "AS-01,AS-02"
 TAG_OPERATOR = "equals"  # equals | contains
+ENV_TAG_KEY = "ENV"
 
 # Time windows
 HISTORY_DAYS = 30  # set 0 to use the full available trend window as "exact"
@@ -25,13 +26,15 @@ TREND_CHUNK_SIZE = CHUNK_SIZE
 REQUEST_TIMEOUT = 120
 VERIFY_SSL = True
 OUTPUT_DIR = "output"
+CSV_SUBDIR = "csv"
+XLSX_SUBDIR = "xlsx"
 
 # Plot settings
 PLOTS_ENABLED = True
 
 # Forecast settings
 FORECAST_ENABLED = True
-FORECAST_HORIZONS = "30,90"
+FORECAST_HORIZONS = "30,90,180,365"
 FORECAST_BACKTEST_HORIZON_DAYS = 30
 FORECAST_BACKTEST_FOLDS = 3
 FORECAST_MIN_TRAIN_DAYS = 90

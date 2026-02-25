@@ -12,6 +12,7 @@ import pandas as pd
 LAGS: Tuple[int, ...] = (1, 2, 3, 7, 14, 21, 28)
 ROLL_WINDOWS: Tuple[int, ...] = (3, 7, 14)
 EPS = 1e-9
+Z90 = 1.2815515655446004
 
 
 def progress_bar(prefix: str, current: int, total: int) -> None:
@@ -64,53 +65,55 @@ def _quantile(values: Iterable[float], q: float) -> float:
 
 
 def build_daily_p95_target(history_util: pd.DataFrame) -> pd.DataFrame:
+    base_columns = ["metric", "hostid", "host", "as_value"]
+    optional_columns = [column for column in ("env_value", "env_group") if column in history_util.columns]
+    output_columns = [*base_columns, *optional_columns, "date", "target_p95"]
     if history_util.empty:
-        return pd.DataFrame(
-            columns=["metric", "hostid", "host", "as_value", "date", "target_p95"]
-        )
+        return pd.DataFrame(columns=output_columns)
 
     frame = history_util.copy()
     frame["date"] = pd.to_datetime(frame["clock"], utc=True, errors="coerce").dt.floor("D")
     frame = frame.dropna(subset=["date", "utilization_pct"])
     if frame.empty:
-        return pd.DataFrame(
-            columns=["metric", "hostid", "host", "as_value", "date", "target_p95"]
-        )
+        return pd.DataFrame(columns=output_columns)
+
+    for column in optional_columns:
+        if column not in frame.columns:
+            frame[column] = ""
 
     grouped = (
-        frame.groupby(["metric", "hostid", "host", "as_value", "date"])["utilization_pct"]
+        frame.groupby([*base_columns, *optional_columns, "date"])["utilization_pct"]
         .quantile(0.95)
         .rename("target_p95")
         .reset_index()
     )
     grouped["target_p95"] = grouped["target_p95"].clip(lower=0.0, upper=100.0)
-    return grouped
+    return grouped[output_columns]
 
 
 def compute_host_risk_metrics(history_util: pd.DataFrame) -> pd.DataFrame:
+    base_columns = ["metric", "hostid", "host", "as_value"]
+    optional_columns = [column for column in ("env_value", "env_group") if column in history_util.columns]
+    output_columns = [
+        *base_columns,
+        *optional_columns,
+        "point_count",
+        "util_mean",
+        "util_std",
+        "p50",
+        "p95",
+        "p99",
+        "duty_cycle_80",
+        "duty_cycle_90",
+        "burstiness",
+        "volatility",
+        "cluster",
+        "overprovisioned",
+    ]
     if history_util.empty:
-        return pd.DataFrame(
-            columns=[
-                "metric",
-                "hostid",
-                "host",
-                "as_value",
-                "point_count",
-                "util_mean",
-                "util_std",
-                "p50",
-                "p95",
-                "p99",
-                "duty_cycle_80",
-                "duty_cycle_90",
-                "burstiness",
-                "volatility",
-                "cluster",
-                "overprovisioned",
-            ]
-        )
+        return pd.DataFrame(columns=output_columns)
 
-    group_cols = ["metric", "hostid", "host", "as_value"]
+    group_cols = [*base_columns, *optional_columns]
     grouped = history_util.groupby(group_cols)["utilization_pct"]
     summary = grouped.agg(
         point_count="count",
@@ -141,7 +144,7 @@ def compute_host_risk_metrics(history_util: pd.DataFrame) -> pd.DataFrame:
 
     summary["cluster"] = summary.apply(classify, axis=1)
     summary["overprovisioned"] = (summary["p95"] <= 25.0) & (summary["duty_cycle_80"] <= 0.01)
-    return summary
+    return summary[output_columns]
 
 
 def _prepare_daily_series(series: pd.Series) -> pd.Series:
@@ -262,7 +265,7 @@ class SimpleGradientBoostingStumps:
         pred = np.full_like(y, self.initial_value, dtype=float)
         self.stumps = []
 
-        n_samples, n_features = X.shape
+        _, n_features = X.shape
         for _ in range(self.n_estimators):
             residual = y - pred
             best_loss = float("inf")
@@ -478,35 +481,13 @@ def run_host_metric_forecasts(
     backtest_folds: int = 3,
     min_train_days: int = 90,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    forecast_columns = [
-        "metric",
-        "hostid",
-        "host",
-        "as_value",
-        "date",
-        "horizon_day",
-        "model",
-        "p50",
-        "p90",
-        "p95",
-    ]
-    backtest_columns = [
-        "metric",
-        "hostid",
-        "host",
-        "as_value",
-        "model",
-        "wape",
-        "mae",
-        "pinball_p90",
-        "calibration_p90",
-        "folds",
-    ]
+    key_columns = ["metric", "hostid", "host", "as_value"]
+    optional_key_columns = [column for column in ("env_value", "env_group") if column in daily_target.columns]
+    group_columns = [*key_columns, *optional_key_columns]
+    forecast_columns = [*group_columns, "date", "horizon_day", "model", "p50", "p90", "p95"]
+    backtest_columns = [*group_columns, "model", "wape", "mae", "pinball_p90", "calibration_p90", "folds"]
     selection_columns = [
-        "metric",
-        "hostid",
-        "host",
-        "as_value",
+        *group_columns,
         "selected_model",
         "selection_score",
         "wape",
@@ -525,7 +506,7 @@ def run_host_metric_forecasts(
 
     models = ("seasonal_naive", "robust_trend", "gbdt_lag")
     max_horizon = int(max(horizons))
-    grouped = list(daily_target.groupby(["metric", "hostid", "host", "as_value"]))
+    grouped = list(daily_target.groupby(group_columns))
 
     forecast_rows: List[Dict] = []
     backtest_rows: List[Dict] = []
@@ -535,7 +516,15 @@ def run_host_metric_forecasts(
     progress_bar("forecast", 0, total_groups)
     completed_groups = 0
 
-    for (metric, hostid, host, as_value), group in grouped:
+    for group_key, group in grouped:
+        if isinstance(group_key, tuple):
+            key_values = dict(zip(group_columns, group_key))
+        else:
+            key_values = {group_columns[0]: group_key}
+        metric = str(key_values["metric"])
+        hostid = str(key_values["hostid"])
+        host = str(key_values["host"])
+        as_value = str(key_values["as_value"])
         series = (
             group.sort_values("date")
             .set_index("date")["target_p95"]
@@ -575,10 +564,7 @@ def run_host_metric_forecasts(
 
             backtest_rows.append(
                 {
-                    "metric": metric,
-                    "hostid": hostid,
-                    "host": host,
-                    "as_value": as_value,
+                    **key_values,
                     "model": model_name,
                     "wape": metrics["wape"],
                     "mae": metrics["mae"],
@@ -594,10 +580,7 @@ def run_host_metric_forecasts(
 
         selection_rows.append(
             {
-                "metric": metric,
-                "hostid": hostid,
-                "host": host,
-                "as_value": as_value,
+                **key_values,
                 "selected_model": selected_model,
                 "selection_score": float(best_row["score"]),
                 "wape": float(best_row["wape"]),
@@ -619,10 +602,7 @@ def run_host_metric_forecasts(
             horizon_day = idx + 1
             forecast_rows.append(
                 {
-                    "metric": metric,
-                    "hostid": hostid,
-                    "host": host,
-                    "as_value": as_value,
+                    **key_values,
                     "date": forecast_date,
                     "horizon_day": horizon_day,
                     "model": selected_model,
@@ -648,11 +628,13 @@ def build_actionable_recommendations(
     risk_metrics: pd.DataFrame,
     forecast_df: pd.DataFrame,
 ) -> pd.DataFrame:
+    optional_key_columns = [column for column in ("env_value", "env_group") if column in risk_metrics.columns]
     columns = [
         "metric",
         "hostid",
         "host",
         "as_value",
+        *optional_key_columns,
         "cluster",
         "overprovisioned",
         "p50",
@@ -684,15 +666,21 @@ def build_actionable_recommendations(
     for _, risk_row in risk_metrics.iterrows():
         metric = str(risk_row["metric"])
         hostid = str(risk_row["hostid"])
-        host_forecast = forecast_df[
-            (forecast_df["metric"] == metric) & (forecast_df["hostid"] == hostid)
-        ].sort_values("date")
+        mask = (forecast_df["metric"] == metric) & (forecast_df["hostid"] == hostid)
+        for column in optional_key_columns:
+            if column in forecast_df.columns:
+                mask = mask & (
+                    forecast_df[column].fillna("").astype(str)
+                    == str(risk_row.get(column, ""))
+                )
+        host_forecast = forecast_df[mask].sort_values("date")
 
         row = {
             "metric": metric,
             "hostid": hostid,
             "host": risk_row["host"],
             "as_value": risk_row["as_value"],
+            **{column: risk_row.get(column, "") for column in optional_key_columns},
             "cluster": risk_row["cluster"],
             "overprovisioned": bool(risk_row["overprovisioned"]),
             "p50": float(risk_row["p50"]),
@@ -728,19 +716,19 @@ def build_actionable_recommendations(
 
         if row["overprovisioned"] and str(risk_row["cluster"]) == "cold":
             status = "overprovisioned"
-            recommendation = "consider consolidation/right-sizing"
+            recommendation = "рассмотреть консолидацию/переразмеривание"
         elif basis_days is None:
             status = "stable"
-            recommendation = "no threshold crossing in forecast horizon"
+            recommendation = "пересечение порога в горизонте прогноза не ожидается"
         elif basis_days < 30:
             status = "critical"
-            recommendation = "capacity action required within 30 days"
+            recommendation = "требуются меры по емкости в ближайшие 30 дней"
         elif basis_days <= 90:
             status = "watch"
-            recommendation = "plan capacity expansion in 30-90 days"
+            recommendation = "запланировать расширение емкости в горизонте 30-90 дней"
         else:
             status = "stable"
-            recommendation = "monitor trend, no immediate action"
+            recommendation = "мониторить тренд, немедленных действий не требуется"
 
         row["status"] = status
         row["recommendation"] = recommendation
@@ -752,3 +740,125 @@ def build_actionable_recommendations(
             output["crossing_date_90_basis"], utc=True, errors="coerce"
         )
     return output
+
+
+def _normal_cdf(values: np.ndarray) -> np.ndarray:
+    vectorized_erf = np.vectorize(math.erf)
+    return 0.5 * (1.0 + vectorized_erf(values / math.sqrt(2.0)))
+
+
+def _confidence_index(wape: float, pinball: float, calibration: float) -> float:
+    if np.isfinite(wape):
+        err_score = 1.0 - min(max(wape, 0.0), 1.5) / 1.5
+    else:
+        err_score = 0.5
+    if np.isfinite(pinball):
+        pinball_score = 1.0 - min(max(pinball, 0.0), 20.0) / 20.0
+    else:
+        pinball_score = 0.5
+    if np.isfinite(calibration):
+        calibration_score = 1.0 - min(abs(calibration - 0.90), 0.50) / 0.50
+    else:
+        calibration_score = 0.5
+    confidence = 100.0 * (0.45 * err_score + 0.25 * pinball_score + 0.30 * calibration_score)
+    return float(np.clip(confidence, 0.0, 100.0))
+
+
+def compute_horizon_risk_probabilities(
+    forecast_df: pd.DataFrame,
+    model_selection: pd.DataFrame,
+    horizons: Sequence[int],
+    threshold: float = 90.0,
+) -> pd.DataFrame:
+    key_columns = ["metric", "hostid", "host", "as_value"]
+    optional_key_columns = [column for column in ("env_value", "env_group") if column in forecast_df.columns]
+    group_columns = [*key_columns, *optional_key_columns]
+    output_columns = [
+        *group_columns,
+        "horizon_days",
+        "threshold",
+        "prob_cross_pct",
+        "prob_cross_adjusted_pct",
+        "confidence_index_pct",
+        "selected_model",
+        "wape",
+        "mae",
+        "pinball_p90",
+        "calibration_p90",
+    ]
+    if forecast_df.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    normalized_horizons = sorted({int(value) for value in horizons if int(value) > 0})
+    if not normalized_horizons:
+        return pd.DataFrame(columns=output_columns)
+
+    model_lookup: Dict[Tuple[str, ...], Dict[str, float]] = {}
+    if not model_selection.empty:
+        for _, row in model_selection.iterrows():
+            key = tuple(str(row[column]) for column in group_columns)
+            model_lookup[key] = {
+                "selected_model": str(row.get("selected_model", "")),
+                "wape": float(row.get("wape", float("nan"))),
+                "mae": float(row.get("mae", float("nan"))),
+                "pinball_p90": float(row.get("pinball_p90", float("nan"))),
+                "calibration_p90": float(row.get("calibration_p90", float("nan"))),
+            }
+
+    rows: List[Dict] = []
+    grouped = list(forecast_df.groupby(group_columns))
+    for group_key, group in grouped:
+        if isinstance(group_key, tuple):
+            key_values = dict(zip(group_columns, group_key))
+        else:
+            key_values = {group_columns[0]: group_key}
+        key_tuple = tuple(str(key_values[column]) for column in group_columns)
+        model_info = model_lookup.get(
+            key_tuple,
+            {
+                "selected_model": "",
+                "wape": float("nan"),
+                "mae": float("nan"),
+                "pinball_p90": float("nan"),
+                "calibration_p90": float("nan"),
+            },
+        )
+        confidence_index = _confidence_index(
+            wape=float(model_info["wape"]),
+            pinball=float(model_info["pinball_p90"]),
+            calibration=float(model_info["calibration_p90"]),
+        )
+        sorted_group = group.sort_values("horizon_day")
+        for horizon in normalized_horizons:
+            horizon_slice = sorted_group[sorted_group["horizon_day"] <= horizon]
+            if horizon_slice.empty:
+                continue
+
+            mu = pd.to_numeric(horizon_slice["p50"], errors="coerce").to_numpy(dtype=float)
+            p90_values = pd.to_numeric(horizon_slice["p90"], errors="coerce").to_numpy(dtype=float)
+            spread = np.maximum(p90_values - mu, 0.5)
+            sigma = np.maximum(spread / Z90, 0.25)
+            z_values = (threshold - mu) / sigma
+            p_day = 1.0 - _normal_cdf(z_values)
+            p_day = np.clip(p_day, 0.0, 1.0)
+            prob_cross = float(1.0 - np.prod(1.0 - p_day))
+            adjustment = 0.5 + 0.5 * (confidence_index / 100.0)
+            prob_cross_adjusted = float(np.clip(prob_cross * adjustment, 0.0, 1.0))
+
+            rows.append(
+                {
+                    **key_values,
+                    "horizon_days": int(horizon),
+                    "threshold": float(threshold),
+                    "prob_cross_pct": prob_cross * 100.0,
+                    "prob_cross_adjusted_pct": prob_cross_adjusted * 100.0,
+                    "confidence_index_pct": confidence_index,
+                    "selected_model": model_info["selected_model"],
+                    "wape": model_info["wape"],
+                    "mae": model_info["mae"],
+                    "pinball_p90": model_info["pinball_p90"],
+                    "calibration_p90": model_info["calibration_p90"],
+                }
+            )
+
+    return pd.DataFrame(rows, columns=output_columns)
