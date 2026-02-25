@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -92,6 +93,66 @@ def safe_slug(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     cleaned = cleaned.strip("._")
     return cleaned or "host"
+
+
+def load_selection_report(path: Path) -> pd.DataFrame:
+    columns = [
+        "hostid",
+        "host",
+        "as_value",
+        "metric",
+        "source",
+        "feature",
+        "entity",
+        "itemid",
+        "key_",
+        "value_type",
+        "transform",
+    ]
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=columns)
+    report = pd.read_csv(path)
+    for column in (
+        "hostid",
+        "host",
+        "as_value",
+        "metric",
+        "source",
+        "feature",
+        "entity",
+        "itemid",
+        "key_",
+        "transform",
+    ):
+        if column in report.columns:
+            report[column] = report[column].astype("string")
+    if "value_type" in report.columns:
+        report["value_type"] = pd.to_numeric(report["value_type"], errors="coerce", downcast="integer")
+    return report
+
+
+def build_selected_counts_from_report(selection_report: pd.DataFrame) -> Dict[str, int]:
+    if selection_report.empty:
+        return {
+            "cpu_target": 0,
+            "ram_target": 0,
+            "disk_target": 0,
+            "ram_features": 0,
+            "disk_features": 0,
+            "feature_total": 0,
+        }
+    source = selection_report["source"].fillna("").astype("string")
+    metric = selection_report["metric"].fillna("").astype("string")
+    target_mask = source == "target"
+    feature_mask = source == "feature"
+    return {
+        "cpu_target": int(((metric == "cpu") & target_mask).sum()),
+        "ram_target": int(((metric == "ram") & target_mask).sum()),
+        "disk_target": int(((metric == "disk") & target_mask).sum()),
+        "ram_features": int(((metric == "ram") & feature_mask).sum()),
+        "disk_features": int(((metric == "disk") & feature_mask).sum()),
+        "feature_total": int(feature_mask.sum()),
+    }
 
 
 def save_xlsx(path: Path, sheets: Dict[str, pd.DataFrame]) -> None:
@@ -214,7 +275,16 @@ def build_conclusion(
     return pd.DataFrame(rows, columns=["section", "key", "value"])
 
 
-def main() -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Zabbix utilization pipeline.")
+    parser.add_argument(
+        "--analysis-only",
+        action="store_true",
+        help="Skip Zabbix API collection and run analysis from existing CSV files in OUTPUT_DIR.",
+    )
+    args = parser.parse_args(argv)
+    analysis_only = bool(args.analysis_only)
+
     if cfg.TAG_OPERATOR not in ("equals", "contains"):
         raise SystemExit("TAG_OPERATOR in config.py must be 'equals' or 'contains'.")
     if cfg.HISTORY_DAYS < 0 or cfg.TREND_DAYS <= 0:
@@ -267,213 +337,329 @@ def main() -> int:
         plots_dir = output_dir / "plots"
         plots_dir.mkdir(parents=True, exist_ok=True)
 
-    if not cfg.ZABBIX_URL or not cfg.ZABBIX_USERNAME or not cfg.ZABBIX_PASSWORD:
-        raise SystemExit(
-            "Set ZABBIX_URL, ZABBIX_USERNAME and ZABBIX_PASSWORD in config.py."
-        )
+    now = datetime.now(timezone.utc)
+    history_all_available = int(cfg.HISTORY_DAYS) == 0
+    history_from = 1 if history_all_available else int((now - timedelta(days=cfg.HISTORY_DAYS)).timestamp())
+    trend_from = int((now - timedelta(days=cfg.TREND_DAYS)).timestamp())
+    time_till = int(now.timestamp())
+    history_window_label = "all" if history_all_available else f"{cfg.HISTORY_DAYS}d"
+    trend_window_label = f"{cfg.TREND_DAYS}d"
 
-    log("Connecting to Zabbix API...")
-    api = ZabbixAPI(
-        url=cfg.ZABBIX_URL,
-        username=cfg.ZABBIX_USERNAME,
-        password=cfg.ZABBIX_PASSWORD,
-        timeout=cfg.REQUEST_TIMEOUT,
-        verify_ssl=cfg.VERIFY_SSL,
+    history_raw_path = output_dir / f"history_raw_api_{history_window_label}.csv"
+    trend_raw_path = output_dir / f"trend_raw_api_{trend_window_label}.csv"
+    history_util_path = output_dir / f"history_exact_{history_window_label}.csv"
+    trend_util_path = output_dir / f"trend_{trend_window_label}.csv"
+    history_features_path = output_dir / f"history_features_{history_window_label}.csv"
+    trend_features_path = output_dir / f"trend_features_{trend_window_label}.csv"
+    selection_path = output_dir / "selected_items.csv"
+
+    history_util = pd.DataFrame(
+        columns=["metric", "clock", "hostid", "host", "as_value", "itemid", "utilization_pct"]
     )
+    trend_util = pd.DataFrame(
+        columns=["metric", "clock", "hostid", "host", "as_value", "itemid", "num", "util_min", "util_avg", "util_max"]
+    )
+    selection_report = pd.DataFrame(
+        columns=[
+            "hostid",
+            "host",
+            "as_value",
+            "metric",
+            "source",
+            "feature",
+            "entity",
+            "itemid",
+            "key_",
+            "value_type",
+            "transform",
+        ]
+    )
+    selected_counts = build_selected_counts_from_report(selection_report)
+    host_count = 0
+    version = "not_requested"
+    api: Optional[ZabbixAPI] = None
+
     try:
-        try:
-            version = api.call("apiinfo.version", {})
-        except Exception:
-            version = "unknown"
-
-        log("Loading hosts by AS tag filter...")
-        hosts = get_hosts_by_as(api, cfg.AS_TAG_KEY, as_values, cfg.TAG_OPERATOR)
-        if not hosts:
-            raise SystemExit("No hosts matched the AS tag filter.")
-        log(f"Matched hosts: {len(hosts)}")
-
-        host_meta: Dict[str, Dict[str, str]] = {}
-        for host in hosts:
-            hostid = str(host.get("hostid"))
-            as_value = pick_as_value(host.get("tags", []), cfg.AS_TAG_KEY, as_values)
-            host_meta[hostid] = {"host": host.get("host", ""), "name": host.get("name", ""), "as_value": as_value}
-
-        hostids = list(host_meta.keys())
-        log("Loading enabled items for matched hosts...")
-        items = get_items_for_hosts(api, hostids, chunk_size=item_chunk_size)
-        log(f"Loaded items: {len(items)}")
-
-        items_by_host = index_items_by_host(items)
-        direct_items, feature_items = select_items(items_by_host, host_meta, disk_fs_preferences)
-
-        cpu_target_count = len([item for item in direct_items if item.metric == "cpu"])
-        ram_target_count = len([item for item in direct_items if item.metric == "ram"])
-        disk_target_count = len([item for item in direct_items if item.metric == "disk"])
-        ram_feature_count = len([item for item in feature_items if item.metric == "ram"])
-        disk_feature_count = len([item for item in feature_items if item.metric == "disk"])
-        feature_total_count = len(feature_items)
-        log(
-            "Selected items: "
-            f"CPU-target={cpu_target_count}, RAM-target={ram_target_count}, "
-            f"Disk-target={disk_target_count}, RAM-features={ram_feature_count}, "
-            f"Disk-features={disk_feature_count}"
-        )
-
-        if cpu_target_count == 0 or ram_target_count == 0 or disk_target_count == 0:
+        if analysis_only:
+            log("Running analysis-only mode (no API collection).")
+            history_util = load_timeseries_csv(
+                history_util_path,
+                [
+                    "metric",
+                    "clock",
+                    "hostid",
+                    "host",
+                    "as_value",
+                    "itemid",
+                    "utilization_pct",
+                ],
+            )
+            trend_util = load_timeseries_csv(
+                trend_util_path,
+                [
+                    "metric",
+                    "clock",
+                    "hostid",
+                    "host",
+                    "as_value",
+                    "itemid",
+                    "num",
+                    "util_min",
+                    "util_avg",
+                    "util_max",
+                ],
+            )
+            if history_util.empty and trend_util.empty:
+                raise SystemExit(
+                    "No existing utilization CSV found for analysis. "
+                    f"Expected at least one of: {history_util_path.name}, {trend_util_path.name}"
+                )
+            selection_report = load_selection_report(selection_path)
+            selected_counts = build_selected_counts_from_report(selection_report)
+            host_count = int(
+                pd.concat(
+                    [
+                        history_util["hostid"] if "hostid" in history_util.columns else pd.Series(dtype="string"),
+                        trend_util["hostid"] if "hostid" in trend_util.columns else pd.Series(dtype="string"),
+                    ],
+                    ignore_index=True,
+                ).dropna().astype("string").nunique()
+            )
+            if selection_report.empty:
+                log(
+                    f"Warning: {selection_path.name} not found or empty. "
+                    "Selection section in reports will be empty."
+                )
             log(
-                "Warning: some metrics are partially missing. "
-                "The script will continue with available metrics."
-            )
-
-        now = datetime.now(timezone.utc)
-        history_all_available = int(cfg.HISTORY_DAYS) == 0
-        history_from = 1 if history_all_available else int((now - timedelta(days=cfg.HISTORY_DAYS)).timestamp())
-        trend_from = int((now - timedelta(days=cfg.TREND_DAYS)).timestamp())
-        time_till = int(now.timestamp())
-        history_window_label = "all" if history_all_available else f"{cfg.HISTORY_DAYS}d"
-        trend_window_label = f"{cfg.TREND_DAYS}d"
-
-        direct_itemid_to_type = {item.itemid: item.value_type for item in direct_items}
-        feature_itemid_to_type = {item.itemid: item.value_type for item in feature_items}
-
-        trend_itemids = sorted(
-            set(
-                list(direct_itemid_to_type.keys())
-                + list(feature_itemid_to_type.keys())
-            )
-        )
-
-        history_raw_path = output_dir / f"history_raw_api_{history_window_label}.csv"
-        trend_raw_path = output_dir / f"trend_raw_api_{trend_window_label}.csv"
-        history_util_path = output_dir / f"history_exact_{history_window_label}.csv"
-        trend_util_path = output_dir / f"trend_{trend_window_label}.csv"
-        history_features_path = output_dir / f"history_features_{history_window_label}.csv"
-        trend_features_path = output_dir / f"trend_features_{trend_window_label}.csv"
-        for path in (
-            history_raw_path,
-            trend_raw_path,
-            history_util_path,
-            trend_util_path,
-            history_features_path,
-            trend_features_path,
-        ):
-            if path.exists():
-                path.unlink()
-
-        history_raw_count = 0
-        history_util_count = 0
-        history_feature_count = 0
-        trend_raw_count = 0
-        trend_util_count = 0
-        trend_feature_count = 0
-        history_cutoff = (
-            None
-            if history_all_available
-            else pd.Timestamp.fromtimestamp(history_from, tz=timezone.utc)
-        )
-
-        def on_trend_chunk(chunk: pd.DataFrame) -> None:
-            nonlocal trend_raw_count
-            nonlocal trend_util_count
-            nonlocal trend_feature_count
-            nonlocal history_raw_count
-            nonlocal history_util_count
-            nonlocal history_feature_count
-            trend_raw_count += len(chunk)
-            append_csv(chunk, trend_raw_path)
-
-            util_chunk = build_direct_trend(chunk, direct_items)
-            trend_util_count += len(util_chunk)
-            append_csv(util_chunk, trend_util_path)
-
-            feature_chunk = build_feature_trend(chunk, feature_items)
-            trend_feature_count += len(feature_chunk)
-            append_csv(feature_chunk, trend_features_path)
-
-            history_source = chunk if history_cutoff is None else chunk[chunk["clock"] >= history_cutoff]
-            if history_source.empty:
-                return
-
-            history_chunk = history_source[["itemid", "clock", "value_avg"]].rename(
-                columns={"value_avg": "value"}
-            )
-            history_chunk["ns"] = 0
-            history_raw_count += len(history_chunk)
-            append_csv(history_chunk, history_raw_path)
-
-            history_util_chunk = build_direct_history(history_chunk, direct_items)
-            history_util_count += len(history_util_chunk)
-            append_csv(history_util_chunk, history_util_path)
-
-            history_feature_chunk = build_feature_history(history_chunk, feature_items)
-            history_feature_count += len(history_feature_chunk)
-            append_csv(history_feature_chunk, history_features_path)
-
-        if history_all_available:
-            log(
-                "Collecting trend data once and deriving all available exact history "
-                "from trend averages..."
+                "Loaded existing utilization checkpoints: "
+                f"{history_util_path.name}, {trend_util_path.name}"
             )
         else:
-            log(
-                f"Collecting trend data once and deriving {cfg.HISTORY_DAYS}-day exact "
-                "history from trend averages..."
+            if not cfg.ZABBIX_URL or not cfg.ZABBIX_USERNAME or not cfg.ZABBIX_PASSWORD:
+                raise SystemExit(
+                    "Set ZABBIX_URL, ZABBIX_USERNAME and ZABBIX_PASSWORD in config.py."
+                )
+
+            log("Connecting to Zabbix API...")
+            api = ZabbixAPI(
+                url=cfg.ZABBIX_URL,
+                username=cfg.ZABBIX_USERNAME,
+                password=cfg.ZABBIX_PASSWORD,
+                timeout=cfg.REQUEST_TIMEOUT,
+                verify_ssl=cfg.VERIFY_SSL,
             )
-        fetch_trend_points(
-            api,
-            itemids=trend_itemids,
-            time_from=trend_from,
-            time_till=time_till,
-            chunk_size=trend_chunk_size,
-            on_chunk=on_trend_chunk,
-            collect=False,
-        )
-        log(
-            f"Trend datapoints: raw={trend_raw_count}, "
-            f"target={trend_util_count}, features={trend_feature_count}"
-        )
-        log(f"Saved raw trend API data: {trend_raw_path.name}")
-        log(
-            f"Derived exact datapoints: raw={history_raw_count}, "
-            f"target={history_util_count}, features={history_feature_count}"
-        )
-        log(f"Saved derived history data: {history_raw_path.name}")
+            try:
+                version = api.call("apiinfo.version", {})
+            except Exception:
+                version = "unknown"
 
-        history_util = load_timeseries_csv(
-            history_util_path,
-            [
-                "metric",
-                "clock",
-                "hostid",
-                "host",
-                "as_value",
-                "itemid",
-                "utilization_pct",
-            ],
-        )
-        trend_util = load_timeseries_csv(
-            trend_util_path,
-            [
-                "metric",
-                "clock",
-                "hostid",
-                "host",
-                "as_value",
-                "itemid",
-                "num",
-                "util_min",
-                "util_avg",
-                "util_max",
-            ],
-        )
+            log("Loading hosts by AS tag filter...")
+            hosts = get_hosts_by_as(api, cfg.AS_TAG_KEY, as_values, cfg.TAG_OPERATOR)
+            if not hosts:
+                raise SystemExit("No hosts matched the AS tag filter.")
+            log(f"Matched hosts: {len(hosts)}")
+            host_count = len(hosts)
 
-        if history_util.empty and trend_util.empty:
-            raise SystemExit("No utilization data extracted from selected items.")
-        log(
-            "Saved utilization checkpoints: "
-            f"{history_util_path.name}, {trend_util_path.name}, "
-            f"{history_features_path.name}, {trend_features_path.name}"
-        )
+            host_meta: Dict[str, Dict[str, str]] = {}
+            for host in hosts:
+                hostid = str(host.get("hostid"))
+                as_value = pick_as_value(host.get("tags", []), cfg.AS_TAG_KEY, as_values)
+                host_meta[hostid] = {"host": host.get("host", ""), "name": host.get("name", ""), "as_value": as_value}
+
+            hostids = list(host_meta.keys())
+            log("Loading enabled items for matched hosts...")
+            items = get_items_for_hosts(api, hostids, chunk_size=item_chunk_size)
+            log(f"Loaded items: {len(items)}")
+
+            items_by_host = index_items_by_host(items)
+            direct_items, feature_items = select_items(items_by_host, host_meta, disk_fs_preferences)
+
+            cpu_target_count = len([item for item in direct_items if item.metric == "cpu"])
+            ram_target_count = len([item for item in direct_items if item.metric == "ram"])
+            disk_target_count = len([item for item in direct_items if item.metric == "disk"])
+            ram_feature_count = len([item for item in feature_items if item.metric == "ram"])
+            disk_feature_count = len([item for item in feature_items if item.metric == "disk"])
+            feature_total_count = len(feature_items)
+            log(
+                "Selected items: "
+                f"CPU-target={cpu_target_count}, RAM-target={ram_target_count}, "
+                f"Disk-target={disk_target_count}, RAM-features={ram_feature_count}, "
+                f"Disk-features={disk_feature_count}"
+            )
+            if cpu_target_count == 0 or ram_target_count == 0 or disk_target_count == 0:
+                log(
+                    "Warning: some metrics are partially missing. "
+                    "The script will continue with available metrics."
+                )
+
+            direct_itemid_to_type = {item.itemid: item.value_type for item in direct_items}
+            feature_itemid_to_type = {item.itemid: item.value_type for item in feature_items}
+            trend_itemids = sorted(set(list(direct_itemid_to_type.keys()) + list(feature_itemid_to_type.keys())))
+            for path in (
+                history_raw_path,
+                trend_raw_path,
+                history_util_path,
+                trend_util_path,
+                history_features_path,
+                trend_features_path,
+            ):
+                if path.exists():
+                    path.unlink()
+
+            history_raw_count = 0
+            history_util_count = 0
+            history_feature_count = 0
+            trend_raw_count = 0
+            trend_util_count = 0
+            trend_feature_count = 0
+            history_cutoff = (
+                None
+                if history_all_available
+                else pd.Timestamp.fromtimestamp(history_from, tz=timezone.utc)
+            )
+
+            def on_trend_chunk(chunk: pd.DataFrame) -> None:
+                nonlocal trend_raw_count
+                nonlocal trend_util_count
+                nonlocal trend_feature_count
+                nonlocal history_raw_count
+                nonlocal history_util_count
+                nonlocal history_feature_count
+                trend_raw_count += len(chunk)
+                append_csv(chunk, trend_raw_path)
+
+                util_chunk = build_direct_trend(chunk, direct_items)
+                trend_util_count += len(util_chunk)
+                append_csv(util_chunk, trend_util_path)
+
+                feature_chunk = build_feature_trend(chunk, feature_items)
+                trend_feature_count += len(feature_chunk)
+                append_csv(feature_chunk, trend_features_path)
+
+                history_source = chunk if history_cutoff is None else chunk[chunk["clock"] >= history_cutoff]
+                if history_source.empty:
+                    return
+
+                history_chunk = history_source[["itemid", "clock", "value_avg"]].rename(columns={"value_avg": "value"})
+                history_chunk["ns"] = 0
+                history_raw_count += len(history_chunk)
+                append_csv(history_chunk, history_raw_path)
+
+                history_util_chunk = build_direct_history(history_chunk, direct_items)
+                history_util_count += len(history_util_chunk)
+                append_csv(history_util_chunk, history_util_path)
+
+                history_feature_chunk = build_feature_history(history_chunk, feature_items)
+                history_feature_count += len(history_feature_chunk)
+                append_csv(history_feature_chunk, history_features_path)
+
+            if history_all_available:
+                log(
+                    "Collecting trend data once and deriving all available exact history "
+                    "from trend averages..."
+                )
+            else:
+                log(
+                    f"Collecting trend data once and deriving {cfg.HISTORY_DAYS}-day exact "
+                    "history from trend averages..."
+                )
+            fetch_trend_points(
+                api,
+                itemids=trend_itemids,
+                time_from=trend_from,
+                time_till=time_till,
+                chunk_size=trend_chunk_size,
+                on_chunk=on_trend_chunk,
+                collect=False,
+            )
+            log(
+                f"Trend datapoints: raw={trend_raw_count}, "
+                f"target={trend_util_count}, features={trend_feature_count}"
+            )
+            log(f"Saved raw trend API data: {trend_raw_path.name}")
+            log(
+                f"Derived exact datapoints: raw={history_raw_count}, "
+                f"target={history_util_count}, features={history_feature_count}"
+            )
+            log(f"Saved derived history data: {history_raw_path.name}")
+
+            history_util = load_timeseries_csv(
+                history_util_path,
+                [
+                    "metric",
+                    "clock",
+                    "hostid",
+                    "host",
+                    "as_value",
+                    "itemid",
+                    "utilization_pct",
+                ],
+            )
+            trend_util = load_timeseries_csv(
+                trend_util_path,
+                [
+                    "metric",
+                    "clock",
+                    "hostid",
+                    "host",
+                    "as_value",
+                    "itemid",
+                    "num",
+                    "util_min",
+                    "util_avg",
+                    "util_max",
+                ],
+            )
+            if history_util.empty and trend_util.empty:
+                raise SystemExit("No utilization data extracted from selected items.")
+            log(
+                "Saved utilization checkpoints: "
+                f"{history_util_path.name}, {trend_util_path.name}, "
+                f"{history_features_path.name}, {trend_features_path.name}"
+            )
+
+            selection_rows = []
+            for item in direct_items:
+                selection_rows.append(
+                    {
+                        "hostid": item.hostid,
+                        "host": item.host,
+                        "as_value": item.as_value,
+                        "metric": item.metric,
+                        "source": "target",
+                        "feature": "",
+                        "entity": "",
+                        "itemid": item.itemid,
+                        "key_": item.key_,
+                        "value_type": item.value_type,
+                        "transform": item.transform,
+                    }
+                )
+            for item in feature_items:
+                selection_rows.append(
+                    {
+                        "hostid": item.hostid,
+                        "host": item.host,
+                        "as_value": item.as_value,
+                        "metric": item.metric,
+                        "source": "feature",
+                        "feature": item.feature,
+                        "entity": item.entity,
+                        "itemid": item.itemid,
+                        "key_": item.key_,
+                        "value_type": item.value_type,
+                        "transform": item.transform,
+                    }
+                )
+            selection_report = pd.DataFrame(selection_rows)
+            selected_counts = {
+                "cpu_target": cpu_target_count,
+                "ram_target": ram_target_count,
+                "disk_target": disk_target_count,
+                "ram_features": ram_feature_count,
+                "disk_features": disk_feature_count,
+                "feature_total": feature_total_count,
+            }
 
         history_summary_all = summarize_history(history_util, by_as=False)
         history_summary_as = summarize_history(history_util, by_as=True)
@@ -575,43 +761,8 @@ def main() -> int:
         else:
             log("Skipping forecasting stage (FORECAST_ENABLED=False).")
 
-        selection_rows = []
-        for item in direct_items:
-            selection_rows.append(
-                {
-                    "hostid": item.hostid,
-                    "host": item.host,
-                    "as_value": item.as_value,
-                    "metric": item.metric,
-                    "source": "target",
-                    "feature": "",
-                    "entity": "",
-                    "itemid": item.itemid,
-                    "key_": item.key_,
-                    "value_type": item.value_type,
-                    "transform": item.transform,
-                }
-            )
-        for item in feature_items:
-            selection_rows.append(
-                {
-                    "hostid": item.hostid,
-                    "host": item.host,
-                    "as_value": item.as_value,
-                    "metric": item.metric,
-                    "source": "feature",
-                    "feature": item.feature,
-                    "entity": item.entity,
-                    "itemid": item.itemid,
-                    "key_": item.key_,
-                    "value_type": item.value_type,
-                    "transform": item.transform,
-                }
-            )
-        selection_report = pd.DataFrame(selection_rows)
-
         log("Saving CSV artifacts...")
-        save_csv(selection_report, output_dir / "selected_items.csv")
+        save_csv(selection_report, selection_path)
         save_csv(history_summary_all, output_dir / f"history_summary_all_{history_window_label}.csv")
         save_csv(history_summary_as, output_dir / f"history_summary_by_as_{history_window_label}.csv")
         save_csv(trend_summary_all, output_dir / f"trend_summary_all_{trend_window_label}.csv")
@@ -623,17 +774,9 @@ def main() -> int:
         save_csv(forecast_df, output_dir / "forecast_daily.csv")
         save_csv(actionable_df, output_dir / "actionable_recommendations.csv")
 
-        selected_counts = {
-            "cpu_target": cpu_target_count,
-            "ram_target": ram_target_count,
-            "disk_target": disk_target_count,
-            "ram_features": ram_feature_count,
-            "disk_features": disk_feature_count,
-            "feature_total": feature_total_count,
-        }
         conclusion = build_conclusion(
             run_at=now,
-            matched_hosts=len(hosts),
+            matched_hosts=host_count,
             selected_counts=selected_counts,
             history_summary_all=history_summary_all,
             trend_summary_all=trend_summary_all,
@@ -664,7 +807,8 @@ def main() -> int:
 
         context = {
             "run_at_utc": now.isoformat(),
-            "api_url": api.url,
+            "run_mode": "analysis_only" if analysis_only else "full",
+            "api_url": api.url if api is not None else cfg.ZABBIX_URL,
             "api_version": version,
             "as_tag_key": cfg.AS_TAG_KEY,
             "as_tag_values": as_values,
@@ -674,7 +818,7 @@ def main() -> int:
             "history_source": "trend.value_avg",
             "trend_days": cfg.TREND_DAYS,
             "trend_window_label": trend_window_label,
-            "host_count": len(hosts),
+            "host_count": host_count,
             "selected": {
                 **selected_counts,
             },
@@ -782,11 +926,12 @@ def main() -> int:
         log(f"Done. Outputs are in: {output_dir.resolve()}")
         return 0
     finally:
-        try:
-            api.logout()
-        except Exception as exc:
-            log(f"Warning: failed to logout from Zabbix API: {exc}")
-        api.session.close()
+        if api is not None:
+            try:
+                api.logout()
+            except Exception as exc:
+                log(f"Warning: failed to logout from Zabbix API: {exc}")
+            api.session.close()
 
 
 if __name__ == "__main__":

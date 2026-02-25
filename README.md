@@ -61,6 +61,17 @@ python3 zabbix_utilization_pipeline.py
 
 Во время `item.get`, `trend.get` и этапа forecast выводится прогресс-бар.
 
+Если данные уже собраны и нужно пересчитать только аналитику/прогноз:
+
+```bash
+python3 zabbix_utilization_pipeline.py --analysis-only
+```
+
+В этом режиме API Zabbix не вызывается; используются уже существующие файлы в `OUTPUT_DIR`:
+- `history_exact_<HISTORY_WINDOW>.csv`
+- `trend_<TREND_WINDOW>.csv`
+- `selected_items.csv` (если есть)
+
 Если на машине не импортируется `matplotlib.pyplot`:
 
 - установите зависимости в `venv` через `pip install -r requirements.txt`;
