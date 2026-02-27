@@ -39,6 +39,7 @@ pip install -r requirements.txt
 - `FORECAST_BACKTEST_FOLDS`
 - `FORECAST_MIN_TRAIN_DAYS`
 - `FORECAST_MAX_PLOTS`
+- `FORECAST_HISTORY_DAYS_TO_SHOW`
 
 Заполните `config.py` перед запуском.
 
@@ -156,7 +157,7 @@ python3 zabbix_utilization_pipeline.py --analysis-only
   - trend окно (`TREND_DAYS`): mean + min/max envelope
   - host heatmap (daily mean)
 - `<metric>_by_as.png` - средняя утилизация по значениям тега `AS`
-- `forecasts/<metric>_<host>_<hostid>.png` - forecast-кривые (`history daily p95` + `p50/p90/p95`, пороги `80/90/95`) для top-risk хостов
+- `forecasts/<metric>_<host>_<hostid>.png` - непрерывный график: факт за последний месяц (синим) + ветки прогноза (`p50/p90/p95`) с цветом по критичности и прозрачностью по уровню доверия
 
 ## Логика предикта
 

@@ -478,6 +478,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     forecast_backtest_folds = int(getattr(cfg, "FORECAST_BACKTEST_FOLDS", 3))
     forecast_min_train_days = int(getattr(cfg, "FORECAST_MIN_TRAIN_DAYS", 90))
     forecast_max_plots = int(getattr(cfg, "FORECAST_MAX_PLOTS", 12))
+    forecast_history_days_to_show = int(getattr(cfg, "FORECAST_HISTORY_DAYS_TO_SHOW", 30))
 
     if any(value <= 0 for value in forecast_horizons):
         raise SystemExit("FORECAST_HORIZONS must contain positive integers.")
@@ -486,10 +487,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         or forecast_backtest_folds <= 0
         or forecast_min_train_days <= 0
         or forecast_max_plots < 0
+        or forecast_history_days_to_show <= 0
     ):
         raise SystemExit(
             "FORECAST_BACKTEST_HORIZON_DAYS, FORECAST_BACKTEST_FOLDS, "
-            "FORECAST_MIN_TRAIN_DAYS must be > 0 and FORECAST_MAX_PLOTS >= 0."
+            "FORECAST_MIN_TRAIN_DAYS, FORECAST_HISTORY_DAYS_TO_SHOW must be > 0 "
+            "and FORECAST_MAX_PLOTS >= 0."
         )
 
     as_values = parse_csv_values(cfg.AS_TAG_VALUES)
@@ -1106,6 +1109,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "forecast_backtest_folds": forecast_backtest_folds,
             "forecast_min_train_days": forecast_min_train_days,
             "forecast_max_plots": forecast_max_plots,
+            "forecast_history_days_to_show": forecast_history_days_to_show,
             "forecast_rows": int(len(forecast_df)),
             "risk_probability_rows": int(len(risk_probabilities)),
             "risk_rows": int(len(risk_metrics)),
@@ -1302,6 +1306,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     host = str(row["host"])
                     selected_model = model_lookup.get((metric, hostid), "")
                     probability_column = f"prob_cross_90_{int(max(forecast_horizons))}d_pct"
+                    horizon_probabilities = {}
+                    for horizon in forecast_horizons:
+                        probability_key = f"prob_cross_90_{int(horizon)}d_pct"
+                        if probability_key in row.index:
+                            horizon_probabilities[int(horizon)] = row.get(probability_key)
                     host_daily = daily_target[
                         (daily_target["metric"] == metric)
                         & (daily_target["hostid"] == hostid)
@@ -1326,6 +1335,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         horizon_days=int(host_forecast["horizon_day"].max()) if "horizon_day" in host_forecast.columns else None,
                         scenario_probability=row.get(probability_column),
                         confidence_index=row.get("confidence_index_pct"),
+                        horizon_probabilities=horizon_probabilities,
+                        history_days_to_show=forecast_history_days_to_show,
                         output_file=forecast_plots_dir
                         / f"{metric}_{safe_slug(host)}_{safe_slug(hostid)}.png",
                     )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import matplotlib
 
@@ -36,6 +36,12 @@ MODEL_LABELS_RU = {
 RISK_BASIS_LABELS_RU = {
     "p50": "по p50",
     "hot_p90_p95": "по p90/p95 для hot",
+}
+STATUS_COLORS = {
+    "critical": "#c62828",
+    "watch": "#ef6c00",
+    "stable": "#2e7d32",
+    "overprovisioned": "#1565c0",
 }
 
 
@@ -79,6 +85,20 @@ def _format_percent(value: object) -> str:
     if np.isnan(num):
         return "n/a"
     return f"{num:.1f}%"
+
+
+def _confidence_style(confidence_index: object) -> tuple[str, float, float]:
+    try:
+        value = float(confidence_index)
+    except (TypeError, ValueError):
+        return "средний", 0.18, 0.09
+    if np.isnan(value):
+        return "средний", 0.18, 0.09
+    if value >= 75.0:
+        return "высокий", 0.28, 0.14
+    if value >= 50.0:
+        return "средний", 0.18, 0.09
+    return "низкий", 0.11, 0.05
 
 
 def plot_metric_dashboard(
@@ -212,25 +232,97 @@ def plot_host_forecast(
     horizon_days: Optional[int] = None,
     scenario_probability: object = None,
     confidence_index: object = None,
+    horizon_probabilities: Optional[Dict[int, object]] = None,
+    history_days_to_show: int = 30,
 ) -> None:
     fig, ax = plt.subplots(figsize=(14, 6), constrained_layout=True)
     metric_label = _label_metric(metric)
+    status_key = str(status).lower()
+    status_color = STATUS_COLORS.get(status_key, "#455a64")
+    confidence_level, alpha_main, alpha_outer = _confidence_style(confidence_index)
 
+    ax.axhspan(0.0, 80.0, color="#2e7d32", alpha=0.03)
+    ax.axhspan(80.0, 90.0, color="#ef6c00", alpha=0.04)
+    ax.axhspan(90.0, 100.0, color="#c62828", alpha=0.05)
+
+    history_plot = pd.DataFrame(columns=["date", "target_p95"])
     if not history_daily.empty:
         history_plot = history_daily.sort_values("date")
+        if history_days_to_show > 0:
+            right_edge = history_plot["date"].max()
+            left_edge = right_edge - pd.Timedelta(days=int(history_days_to_show))
+            history_plot = history_plot[history_plot["date"] >= left_edge]
         ax.plot(
             history_plot["date"],
             history_plot["target_p95"],
-            label="История (daily p95)",
+            label=f"Факт (последние {history_days_to_show} дней)",
             linewidth=1.5,
-            alpha=0.9,
+            alpha=0.95,
+            color="#1e88e5",
         )
 
+    forecast_plot = pd.DataFrame(columns=["date", "p50", "p90", "p95"])
     if not forecast_daily.empty:
         forecast_plot = forecast_daily.sort_values("date")
-        ax.plot(forecast_plot["date"], forecast_plot["p50"], label="Прогноз p50", linewidth=1.8)
-        ax.plot(forecast_plot["date"], forecast_plot["p90"], label="Прогноз p90", linewidth=1.2)
-        ax.plot(forecast_plot["date"], forecast_plot["p95"], label="Прогноз p95", linewidth=1.0, alpha=0.9)
+        if not history_plot.empty:
+            anchor_date = history_plot["date"].iloc[-1]
+            anchor_value = float(history_plot["target_p95"].iloc[-1])
+            p50_x = [anchor_date, *forecast_plot["date"].to_list()]
+            p50_y = [anchor_value, *forecast_plot["p50"].to_list()]
+            p90_x = [anchor_date, *forecast_plot["date"].to_list()]
+            p90_y = [anchor_value, *forecast_plot["p90"].to_list()]
+            p95_x = [anchor_date, *forecast_plot["date"].to_list()]
+            p95_y = [anchor_value, *forecast_plot["p95"].to_list()]
+        else:
+            p50_x = forecast_plot["date"].to_list()
+            p50_y = forecast_plot["p50"].to_list()
+            p90_x = forecast_plot["date"].to_list()
+            p90_y = forecast_plot["p90"].to_list()
+            p95_x = forecast_plot["date"].to_list()
+            p95_y = forecast_plot["p95"].to_list()
+
+        ax.plot(
+            p50_x,
+            p50_y,
+            label="Прогноз: ожидаемый (p50)",
+            linewidth=2.1,
+            color=status_color,
+        )
+        ax.plot(
+            p90_x,
+            p90_y,
+            label="Прогноз: риск-сценарий (p90)",
+            linewidth=1.4,
+            linestyle="--",
+            color=status_color,
+            alpha=0.95,
+        )
+        ax.plot(
+            p95_x,
+            p95_y,
+            label="Прогноз: стресс-сценарий (p95)",
+            linewidth=1.2,
+            linestyle=":",
+            color=status_color,
+            alpha=0.95,
+        )
+
+        ax.fill_between(
+            forecast_plot["date"],
+            forecast_plot["p50"],
+            forecast_plot["p90"],
+            color=status_color,
+            alpha=alpha_main,
+            label="Вилка доверия: p50-p90",
+        )
+        ax.fill_between(
+            forecast_plot["date"],
+            forecast_plot["p90"],
+            forecast_plot["p95"],
+            color=status_color,
+            alpha=alpha_outer,
+            label="Хвост риска: p90-p95",
+        )
 
     ax.axhline(80.0, color="#d6a800", linestyle="--", linewidth=1.0, label="Порог 80%")
     ax.axhline(90.0, color="#d45f00", linestyle="--", linewidth=1.0, label="Порог 90%")
@@ -262,6 +354,13 @@ def plot_host_forecast(
         explain_lines.append(f"Вероятность сценария: {_format_percent(scenario_probability)}")
     if confidence_index is not None:
         explain_lines.append(f"Индекс доверия: {_format_percent(confidence_index)}")
+    explain_lines.append(f"Уровень доверия: {confidence_level}")
+    if horizon_probabilities:
+        ordered_horizons = sorted(int(value) for value in horizon_probabilities.keys())
+        probability_parts = []
+        for horizon in ordered_horizons:
+            probability_parts.append(f"{horizon}д={_format_percent(horizon_probabilities.get(horizon))}")
+        explain_lines.append("Вероятность по горизонтам: " + ", ".join(probability_parts))
     explain_text = "\n".join(explain_lines)
     ax.text(
         0.99,
