@@ -1,0 +1,45 @@
+{
+  "Grafana": {
+    "BD": [
+      "grafana-bd01.ros.ru"
+    ],
+    "WEB": [
+      "grafana-web01.ros.ru"
+    ]
+  },
+  "Zabbix": {
+    "SERVER": [
+      "zabbix-server01.ros.ru"
+    ],
+    "PROXY": [
+      "zabbix-proxy01.ros.ru",
+      "zabbix-proxy02.ros.ru"
+    ],
+    "DB": [
+      "zabbix-db01.ros.ru"
+    ]
+  },
+  "VictoriaMetrics": {
+    "INSERT": [
+      "vminsert01.ros.ru"
+    ],
+    "SELECT": [
+      "vmselect01.ros.ru"
+    ],
+    "STORAGE": [
+      "vmstorage01.ros.ru",
+      "vmstorage02.ros.ru"
+    ],
+    "ALERT": [
+      "vmalert01.ros.ru"
+    ]
+  },
+  "PostgreSQL": {
+    "PRIMARY": [
+      "postgres01.ros.ru"
+    ],
+    "REPLICA": [
+      "postgres02.ros.ru"
+    ]
+  }
+}
