@@ -9,10 +9,13 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 import urllib3
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -30,6 +33,9 @@ SERVICE_HINTS = (
     'postgres', 'postgresql', 'pgsql'
 )
 IGNORE_PATH_PREFIXES = ('/proc/', '/sys/', '/dev/', '/run/', '/tmp/')
+HEADER_FILL = PatternFill(fill_type='solid', fgColor='D9EAF7')
+HEADER_FONT = Font(bold=True)
+TOP_ALIGN = Alignment(vertical='top', wrap_text=True)
 
 
 class ZabbixAPIError(RuntimeError):
@@ -363,12 +369,135 @@ def build_report(config_module, tree: dict[str, dict[str, list[str]]]) -> dict[s
             zbx_logout(config_module.ZABBIX_URL, auth, config_module.TIMEOUT, config_module.VERIFY_SSL)
 
 
+def iter_hosts(report: dict[str, Any]) -> Iterable[tuple[str, str, str, dict[str, Any]]]:
+    for system_name, roles in report['inventory'].items():
+        for role_name, hosts in roles.items():
+            for host_ref, host_data in hosts.items():
+                yield system_name, role_name, host_ref, host_data
+
+
+def style_worksheet(ws) -> None:
+    ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = ws.dimensions
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = TOP_ALIGN
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = TOP_ALIGN
+    for idx, column_cells in enumerate(ws.columns, start=1):
+        max_len = 0
+        for cell in column_cells:
+            value = '' if cell.value is None else str(cell.value)
+            max_len = max(max_len, min(len(value), 60))
+        ws.column_dimensions[get_column_letter(idx)].width = max(12, min(max_len + 2, 60))
+
+
+def add_sheet(wb: Workbook, title: str, headers: list[str], rows: list[list[Any]]) -> None:
+    ws = wb.create_sheet(title)
+    ws.append(headers)
+    for row in rows:
+        ws.append(row)
+    style_worksheet(ws)
+
+
+def write_xlsx_report(report: dict[str, Any], output_path: Path) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Summary'
+    summary_headers = [
+        'System', 'Role', 'Host Ref', 'Status', 'Zabbix Host', 'Visible Name',
+        'Templates', 'Groups', 'Item Count', 'Matched Sections',
+        'Services', 'Filesystems', 'Block Devices', 'Interfaces', 'SSL Targets', 'Paths'
+    ]
+    ws.append(summary_headers)
+
+    service_rows: list[list[Any]] = []
+    filesystem_rows: list[list[Any]] = []
+    block_rows: list[list[Any]] = []
+    network_rows: list[list[Any]] = []
+    ssl_rows: list[list[Any]] = []
+    path_rows: list[list[Any]] = []
+    raw_rows: list[list[Any]] = []
+
+    for system_name, role_name, host_ref, host_data in iter_hosts(report):
+        zabbix_host = host_data.get('zabbix_host') or {}
+        summary = host_data.get('summary', {})
+        confirmed = host_data.get('confirmed', {})
+
+        ws.append([
+            system_name,
+            role_name,
+            host_ref,
+            host_data.get('status'),
+            zabbix_host.get('host'),
+            zabbix_host.get('name'),
+            ', '.join(host_data.get('templates', [])),
+            ', '.join(host_data.get('groups', [])),
+            summary.get('item_count'),
+            ', '.join(summary.get('matched_sections', [])),
+            summary.get('service_count'),
+            summary.get('filesystem_metric_count'),
+            summary.get('block_device_metric_count'),
+            summary.get('network_metric_count'),
+            summary.get('ssl_target_count'),
+            summary.get('path_count'),
+        ])
+
+        for row in confirmed.get('services', []):
+            service_rows.append([
+                system_name, role_name, host_ref, row.get('unit'), row.get('field'),
+                row.get('lastvalue'), row.get('lastclock'), row.get('item_name'), row.get('item_key')
+            ])
+        for row in confirmed.get('filesystems', []):
+            filesystem_rows.append([
+                system_name, role_name, host_ref, row.get('mountpoint'), row.get('metric'),
+                row.get('lastvalue'), row.get('units'), row.get('lastclock'), row.get('item_name'), row.get('item_key')
+            ])
+        for row in confirmed.get('block_devices', []):
+            block_rows.append([
+                system_name, role_name, host_ref, row.get('device'), row.get('metric'),
+                row.get('lastvalue'), row.get('units'), row.get('lastclock'), row.get('item_name'), row.get('item_key')
+            ])
+        for row in confirmed.get('network_interfaces', []):
+            network_rows.append([
+                system_name, role_name, host_ref, row.get('interface'), row.get('lastvalue'),
+                row.get('units'), row.get('lastclock'), row.get('item_name'), row.get('item_key')
+            ])
+        for row in confirmed.get('ssl_targets', []):
+            ssl_rows.append([
+                system_name, role_name, host_ref, row.get('target'), row.get('lastvalue'),
+                row.get('lastclock'), row.get('item_name'), row.get('item_key')
+            ])
+        for row in confirmed.get('paths_found_in_items', []):
+            path_rows.append([
+                system_name, role_name, host_ref, row.get('path'), row.get('kind'),
+                row.get('lastvalue_excerpt'), row.get('lastclock'), row.get('item_name'), row.get('item_key')
+            ])
+        for row in confirmed.get('raw_service_related_items', []):
+            raw_rows.append([
+                system_name, role_name, host_ref, row.get('item_name'), row.get('item_key'),
+                row.get('lastvalue'), row.get('lastclock')
+            ])
+
+    style_worksheet(ws)
+    add_sheet(wb, 'Services', ['System', 'Role', 'Host Ref', 'Unit', 'Field', 'Last Value', 'Last Clock', 'Item Name', 'Item Key'], service_rows)
+    add_sheet(wb, 'Filesystems', ['System', 'Role', 'Host Ref', 'Mountpoint', 'Metric', 'Last Value', 'Units', 'Last Clock', 'Item Name', 'Item Key'], filesystem_rows)
+    add_sheet(wb, 'BlockDevices', ['System', 'Role', 'Host Ref', 'Device', 'Metric', 'Last Value', 'Units', 'Last Clock', 'Item Name', 'Item Key'], block_rows)
+    add_sheet(wb, 'Interfaces', ['System', 'Role', 'Host Ref', 'Interface', 'Last Value', 'Units', 'Last Clock', 'Item Name', 'Item Key'], network_rows)
+    add_sheet(wb, 'SSL', ['System', 'Role', 'Host Ref', 'Target', 'Last Value', 'Last Clock', 'Item Name', 'Item Key'], ssl_rows)
+    add_sheet(wb, 'Paths', ['System', 'Role', 'Host Ref', 'Path', 'Kind', 'Last Value Excerpt', 'Last Clock', 'Item Name', 'Item Key'], path_rows)
+    add_sheet(wb, 'RawServiceItems', ['System', 'Role', 'Host Ref', 'Item Name', 'Item Key', 'Last Value', 'Last Clock'], raw_rows)
+    wb.save(output_path)
+
+
 def main() -> int:
     base_dir = Path.cwd()
     config_path = base_dir / 'monitoring_config.py'
     if not config_path.exists():
         print('[ERROR] monitoring_config.py not found near the script.', file=sys.stderr)
-        print('Copy monitoring_config.example.py to monitoring_config.py and adjust credentials.', file=sys.stderr)
+        print('Copy examples/monitoring_config.example.py to monitoring_config.py and adjust credentials.', file=sys.stderr)
         return 2
 
     config_module = load_module(config_path, 'monitoring_config')
@@ -380,8 +509,8 @@ def main() -> int:
     tree = load_host_tree(tree_path)
     report = build_report(config_module, tree)
 
-    output_path = base_dir / str(config_module.OUTPUT_JSON_PATH)
-    output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    output_path = base_dir / str(config_module.OUTPUT_XLSX_PATH)
+    write_xlsx_report(report, output_path)
 
     print(f'[OK] Report written to: {output_path}')
     return 0
