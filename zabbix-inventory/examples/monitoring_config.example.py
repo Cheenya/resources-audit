@@ -7,5 +7,5 @@ TIMEOUT = 30
 # Путь до JSON-файла с деревом систем/ролей/хостов.
 HOST_TREE_PATH = 'hosts_tree.json'
 
-# Путь до результирующего файла.
-OUTPUT_JSON_PATH = 'zabbix_inventory_report.json'
+# Путь до результирующего XLSX-файла.
+OUTPUT_XLSX_PATH = 'zabbix_inventory_report.xlsx'
