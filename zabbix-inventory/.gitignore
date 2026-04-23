@@ -1,4 +1,4 @@
 monitoring_config.py
 hosts_tree.json
-zabbix_inventory_report.json
+zabbix_inventory_report.xlsx
 __pycache__/
