@@ -5,18 +5,6 @@ import sys
 from collections import defaultdict
 from openpyxl import load_workbook
 
-DOMAIN_ACCOUNTS = {
-    "rosap.com": "rosap",
-    "dom.ru": "dom",
-}
-
-def find_domain(host: str) -> str:
-    host = host.strip().lower()
-    matches = [d for d in DOMAIN_ACCOUNTS if host.endswith(d)]
-    if not matches:
-        return ""
-    return sorted(matches, key=len, reverse=True)[0]
-
 def main(input_xlsx: str, output_path: str | None) -> int:
     wb = load_workbook(input_xlsx)
     if "Services" not in wb.sheetnames:
@@ -41,28 +29,42 @@ def main(input_xlsx: str, output_path: str | None) -> int:
 
     out_lines: list[str] = []
     out_lines.append("# Commands generated from XLSX")
-    out_lines.append("# Run block-by-block; you'll be prompted for SSH password/key if needed.")
+    out_lines.append("# 1) SSH into the host manually")
+    out_lines.append("# 2) Copy/paste the block below")
     out_lines.append("")
 
     for host, units in sorted(by_host.items()):
-        domain = find_domain(host)
-        user = DOMAIN_ACCOUNTS.get(domain, "REPLACE_ME")
         out_lines.append(f"echo '==== {host} ===='")
-        out_lines.append(f"ssh {user}@{host} <<'EOF'")
-        out_lines.append("set -eu")
+        out_lines.append("systemctl list-units --type=service --state=running")
         out_lines.append("")
-        for unit in sorted(set(units)):
+
+        units = sorted(set(units))
+        for unit in units:
             out_lines.append(f"echo '--- {unit} ---'")
             out_lines.append(f"systemctl show -p ExecStart -p FragmentPath -p EnvironmentFile {unit}")
             out_lines.append(f"systemctl status {unit} --no-pager || true")
             out_lines.append(f"journalctl -u {unit} -n 50 --no-pager || true")
+
             out_lines.append('UNIT_BASE="' + unit + '"')
             out_lines.append('UNIT_BASE="${UNIT_BASE%%.service*}"')
+
+            out_lines.append('echo "Executable + potential app dirs"')
+            out_lines.append('ls -ld /usr/bin/*"$UNIT_BASE"* /usr/local/bin/*"$UNIT_BASE"* 2>/dev/null || true')
+
+            out_lines.append('echo "Config candidates"')
             out_lines.append('ls -ld /etc/*"$UNIT_BASE"* /etc/"$UNIT_BASE" 2>/dev/null || true')
+
+            out_lines.append('echo "Data candidates"')
+            out_lines.append('ls -ld /var/lib/*"$UNIT_BASE"* /var/lib/"$UNIT_BASE" /opt/*"$UNIT_BASE"* /opt/"$UNIT_BASE" 2>/dev/null || true')
+
+            out_lines.append('echo "Log candidates"')
             out_lines.append('ls -ld /var/log/*"$UNIT_BASE"* /var/log/"$UNIT_BASE"* 2>/dev/null || true')
-            out_lines.append('ls -ld /var/lib/*"$UNIT_BASE"* /var/lib/"$UNIT_BASE"* 2>/dev/null || true')
+
             out_lines.append("")
-        out_lines.append("EOF")
+
+        out_lines.append('echo "Certificate candidates"')
+        out_lines.append("find /etc -maxdepth 5 -type f 2>/dev/null | egrep -i '\\.(crt|pem|key|cer|pfx)$' | head")
+
         out_lines.append("")
 
     text = "\n".join(out_lines)
