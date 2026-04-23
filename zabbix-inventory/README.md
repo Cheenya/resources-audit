@@ -1,19 +1,20 @@
 # Zabbix inventory collector
 
-Файлы:
-- `monitoring_config.example.py` — пример конфига подключения к Zabbix API
-- `hosts_tree.example.json` — отдельный JSON со структурой `Система -> Роль -> Хосты`
+## Файлы
+
+- `examples/monitoring_config.example.py` — пример конфига подключения к Zabbix API
+- `examples/hosts_tree.example.json` — отдельный JSON со структурой `Система -> Роль -> Хосты`
 - `zabbix_inventory_collect.py` — основной скрипт
 
 ## Как запустить
 
-1. Скопируй `monitoring_config.example.py` в `monitoring_config.py`
-2. Скопируй `hosts_tree.example.json` в `hosts_tree.json`
+1. Скопируй `examples/monitoring_config.example.py` в `monitoring_config.py`
+2. Скопируй `examples/hosts_tree.example.json` в `hosts_tree.json`
 3. Заполни URL/логин/пароль и свои хосты
-4. Установи зависимость:
+4. Установи зависимости:
 
 ```bash
-pip install requests
+pip install -r requirements.txt
 ```
 
 5. Запусти:
@@ -22,7 +23,7 @@ pip install requests
 python zabbix_inventory_collect.py
 ```
 
-На выходе появится `zabbix_inventory_report.json`.
+На выходе появится XLSX-отчёт по пути, указанному в `OUTPUT_XLSX_PATH` (по умолчанию `zabbix_inventory_report.xlsx`).
 
 ## Что именно скрипт собирает
 
@@ -34,4 +35,4 @@ python zabbix_inventory_collect.py
 - SSL endpoints
 - абсолютные пути, которые реально попались в item name / key / lastvalue
 
-Скрипт специально **не подставляет типовые пути по умолчанию** и **не угадывает** каталоги, которых нет в Zabbix.
+Скрипт специально **не** подставляет типовые пути по умолчанию и **не** угадывает каталоги, которых нет в Zabbix.
